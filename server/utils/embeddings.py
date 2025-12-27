@@ -9,11 +9,9 @@ from pathlib import Path
 from typing import List, Dict, Optional, Any
 from functools import wraps
 import hashlib
-import json
 
 from dotenv import load_dotenv
 from docling.document_converter import DocumentConverter
-from docling.datamodel.base_models import InputFormat
 from pymongo import MongoClient
 from pymongo.collection import Collection
 from openai import OpenAI
@@ -160,7 +158,7 @@ class EmbeddingProcessor:
         """Create embedding for text using OpenRouter."""
         try:
             # Run in executor to avoid blocking
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             response = await loop.run_in_executor(
                 None,
                 lambda: self.openai_client.embeddings.create(
@@ -175,27 +173,28 @@ class EmbeddingProcessor:
     
     async def _process_file(self, file_path: str) -> Dict[str, Any]:
         """Process a single file and return chunks with metadata."""
-        file_path_obj = Path(file_path).resolve()  # Normalize to absolute path
-        file_path = str(file_path_obj)  # Use normalized path
+        file_path_obj = Path(file_path).resolve()
+        file_path = str(file_path_obj)
         file_ext = file_path_obj.suffix.lower()
+        file_name = file_path_obj.name
         
-        print(f"📄 Processing: {file_path_obj.name}")
+        print(f"📄 Processing: {file_name}")
         
-        # Process with docling
+        # Get file hash and size BEFORE processing (in case file changes during processing)
+        file_hash = self._get_file_hash(file_path)
+        file_size = os.path.getsize(file_path)
+        
+        # Extract text based on file type
         if file_ext == '.pdf':
             result = self.converter.convert(file_path)
-            # Extract text from docling result (try markdown first, fallback to text)
             try:
                 text = result.document.export_to_markdown()
             except AttributeError:
-                # Fallback if export_to_markdown doesn't exist
                 try:
                     text = result.document.export_to_text()
                 except AttributeError:
-                    # If neither exists, try to get text from document structure
                     text = str(result.document)
         elif file_ext == '.md':
-            # For markdown, read directly
             with open(file_path, 'r', encoding='utf-8') as f:
                 text = f.read()
         else:
@@ -207,21 +206,21 @@ class EmbeddingProcessor:
         
         # Create embeddings for each chunk
         chunk_embeddings = []
-        for i, chunk in enumerate(chunks):
-            print(f"  → Creating embedding for chunk {i+1}/{len(chunks)}")
+        for i, chunk in enumerate(chunks, 1):
+            print(f"  → Creating embedding for chunk {i}/{len(chunks)}")
             embedding = await self._create_embedding(chunk)
             chunk_embeddings.append({
-                'chunk_index': i,
+                'chunk_index': i - 1,
                 'text': chunk,
                 'embedding': embedding,
                 'chunk_size': len(chunk)
             })
         
         return {
-            'file_path': str(file_path),
-            'file_name': file_path_obj.name,
-            'file_hash': self._get_file_hash(file_path),
-            'file_size': os.path.getsize(file_path),
+            'file_path': file_path,
+            'file_name': file_name,
+            'file_hash': file_hash,
+            'file_size': file_size,
             'total_chunks': len(chunks),
             'chunks': chunk_embeddings
         }
@@ -229,44 +228,40 @@ class EmbeddingProcessor:
     async def _store_chunks(self, processed_file: Dict[str, Any], replace_existing: bool = True):
         """Store chunks in MongoDB."""
         file_path = processed_file['file_path']
-        file_hash = processed_file['file_hash']
+        file_name = processed_file['file_name']
         
         # Check if file already exists
-        existing = self.collection.find_one({"file_path": file_path})
-        
-        if existing and not replace_existing:
-            print(f"  ⏭️  Skipping {processed_file['file_name']} (already exists)")
+        if not replace_existing and self.collection.find_one({"file_path": file_path}):
+            print(f"  ⏭️  Skipping {file_name} (already exists)")
             return
         
         # Delete existing chunks for this file if replacing
-        if existing:
-            self.collection.delete_many({"file_path": file_path})
-            print(f"  🔄 Replacing existing chunks for {processed_file['file_name']}")
+        if replace_existing:
+            deleted = self.collection.delete_many({"file_path": file_path}).deleted_count
+            if deleted > 0:
+                print(f"  🔄 Replacing existing chunks for {file_name}")
         
-        # Insert chunks as separate documents
-        documents_to_insert = []
-        for chunk_data in processed_file['chunks']:
-            doc = {
-                'file_path': file_path,
-                'file_name': processed_file['file_name'],
-                'file_hash': file_hash,
-                'file_size': processed_file['file_size'],
-                'chunk_index': chunk_data['chunk_index'],
-                'text': chunk_data['text'],
-                'embedding': chunk_data['embedding'],
-                'chunk_size': chunk_data['chunk_size'],
-                'total_chunks': processed_file['total_chunks'],
-                'metadata': {
-                    'model': self.embedding_model,
-                    'dimensions': EMBEDDING_DIMENSIONS
-                }
+        # Build documents to insert
+        documents_to_insert = [{
+            'file_path': file_path,
+            'file_name': file_name,
+            'file_hash': processed_file['file_hash'],
+            'file_size': processed_file['file_size'],
+            'chunk_index': chunk['chunk_index'],
+            'text': chunk['text'],
+            'embedding': chunk['embedding'],
+            'chunk_size': chunk['chunk_size'],
+            'total_chunks': processed_file['total_chunks'],
+            'metadata': {
+                'model': self.embedding_model,
+                'dimensions': EMBEDDING_DIMENSIONS
             }
-            documents_to_insert.append(doc)
+        } for chunk in processed_file['chunks']]
         
         # Bulk insert
         if documents_to_insert:
             self.collection.insert_many(documents_to_insert)
-            print(f"  ✓ Stored {len(documents_to_insert)} chunks for {processed_file['file_name']}")
+            print(f"  ✓ Stored {len(documents_to_insert)} chunks for {file_name}")
     
     @retry_async()
     async def process_file(self, file_path: str, replace_existing: bool = True) -> Dict[str, Any]:
@@ -322,8 +317,7 @@ class EmbeddingProcessor:
         results = []
         for file_path in files:
             try:
-                result = await self.process_file(file_path, replace_existing=replace_existing)
-                results.append(result)
+                results.append(await self.process_file(file_path, replace_existing=replace_existing))
             except Exception as e:
                 print(f"✗ Failed to process {file_path}: {e}")
                 results.append({'file_path': file_path, 'error': str(e)})
@@ -332,7 +326,9 @@ class EmbeddingProcessor:
     
     def get_chunks_for_file(self, file_path: str) -> List[Dict[str, Any]]:
         """Retrieve all chunks for a specific file from MongoDB."""
-        chunks = list(self.collection.find({"file_path": file_path}).sort("chunk_index", 1))
+        # Normalize path to match how it's stored
+        normalized_path = str(Path(file_path).resolve())
+        chunks = list(self.collection.find({"file_path": normalized_path}).sort("chunk_index", 1))
         # Convert ObjectId to string for JSON serialization
         for chunk in chunks:
             chunk['_id'] = str(chunk['_id'])
@@ -347,7 +343,9 @@ class EmbeddingProcessor:
         Returns:
             Number of chunks deleted
         """
-        result = self.collection.delete_many({"file_path": file_path})
+        # Normalize path to match how it's stored
+        normalized_path = str(Path(file_path).resolve())
+        result = self.collection.delete_many({"file_path": normalized_path})
         deleted_count = result.deleted_count
         if deleted_count > 0:
             print(f"  🗑️  Deleted {deleted_count} chunks for {Path(file_path).name}")
@@ -359,28 +357,23 @@ class EmbeddingProcessor:
         Returns:
             Dict mapping file_path to file metadata (file_hash, file_name, etc.)
         """
-        # Get unique file_paths with their latest hash
-        pipeline = [
-            {"$group": {
-                "_id": "$file_path",
-                "file_hash": {"$first": "$file_hash"},
-                "file_name": {"$first": "$file_name"},
-                "file_size": {"$first": "$file_size"},
-                "total_chunks": {"$first": "$total_chunks"}
-            }}
-        ]
+        pipeline = [{"$group": {
+            "_id": "$file_path",
+            "file_hash": {"$first": "$file_hash"},
+            "file_name": {"$first": "$file_name"},
+            "file_size": {"$first": "$file_size"},
+            "total_chunks": {"$first": "$total_chunks"}
+        }}]
         
-        processed_files = {}
-        for doc in self.collection.aggregate(pipeline):
-            file_path = doc['_id']
-            processed_files[file_path] = {
+        return {
+            doc['_id']: {
                 'file_hash': doc.get('file_hash'),
                 'file_name': doc.get('file_name'),
                 'file_size': doc.get('file_size'),
                 'total_chunks': doc.get('total_chunks')
             }
-        
-        return processed_files
+            for doc in self.collection.aggregate(pipeline)
+        }
     
     async def sync_embeddings(
         self,
@@ -411,80 +404,66 @@ class EmbeddingProcessor:
         print(f"📊 Found {len(processed_files)} processed files in database")
         
         # Get all files in directory (normalize to absolute paths)
-        local_files = {}
         directory_abs = directory_path.resolve()
-        for file_path in directory_abs.iterdir():
-            if file_path.is_file() and file_path.suffix.lower() in file_extensions:
-                file_path_str = str(file_path.resolve())  # Normalize to absolute path
-                local_files[file_path_str] = {
-                    'file_path': file_path_str,
-                    'file_name': file_path.name,
-                    'exists': True
-                }
+        local_files = {
+            str(file_path.resolve()): {'file_name': file_path.name}
+            for file_path in directory_abs.iterdir()
+            if file_path.is_file() and file_path.suffix.lower() in file_extensions
+        }
         
         print(f"📁 Found {len(local_files)} files in directory")
         
         # Determine what needs to be done
-        to_insert = []  # New files
-        to_update = []  # Changed files (hash mismatch)
-        to_delete = []  # Files in DB but not in directory
+        to_insert = []
+        to_update = []
+        to_delete = []
         
-        # Check local files
-        for file_path, file_info in local_files.items():
+        # Check local files (compute hashes once)
+        file_hashes = {}
+        for file_path in local_files:
             if file_path not in processed_files:
-                # New file - needs to be inserted
                 to_insert.append(file_path)
             else:
-                # File exists in DB - check if it changed
-                current_hash = self._get_file_hash(file_path)
-                stored_hash = processed_files[file_path].get('file_hash')
-                if current_hash != stored_hash:
-                    # File changed - needs to be updated
+                # Compute hash once and store for later use
+                file_hash = self._get_file_hash(file_path)
+                file_hashes[file_path] = file_hash
+                if file_hash != processed_files[file_path].get('file_hash'):
                     to_update.append(file_path)
         
         # Check for deleted files (in DB but not in directory)
-        for file_path in processed_files.keys():
-            if file_path not in local_files:
-                to_delete.append(file_path)
+        to_delete = [fp for fp in processed_files if fp not in local_files]
         
         print(f"\n🔄 Sync plan:")
         print(f"  • New files: {len(to_insert)}")
         print(f"  • Updated files: {len(to_update)}")
         print(f"  • Deleted files: {len(to_delete)}")
         
-        results = {
-            'inserted': [],
-            'updated': [],
-            'deleted': [],
-            'errors': []
-        }
+        results = {'inserted': [], 'updated': [], 'deleted': [], 'errors': []}
+        
+        async def _process_with_error_handling(file_path: str, action: str):
+            """Helper to process file with error handling."""
+            try:
+                return await self.process_file(file_path, replace_existing=True)
+            except Exception as e:
+                results['errors'].append({'file_path': file_path, 'error': str(e)})
+                print(f"✗ Failed to {action} {file_path}: {e}")
+                return None
         
         # Process inserts (new files)
         if to_insert:
             print(f"\n✨ Processing {len(to_insert)} new files...")
             for file_path in to_insert:
-                try:
-                    processed = await self.process_file(file_path, replace_existing=True)
+                processed = await _process_with_error_handling(file_path, 'process')
+                if processed:
                     results['inserted'].append(processed)
-                except Exception as e:
-                    error_info = {'file_path': file_path, 'error': str(e)}
-                    results['errors'].append(error_info)
-                    print(f"✗ Failed to process {file_path}: {e}")
         
         # Process updates (changed files)
         if to_update:
             print(f"\n📝 Processing {len(to_update)} updated files...")
             for file_path in to_update:
-                try:
-                    # Delete old chunks first
-                    self.delete_embeddings_for_file(file_path)
-                    # Process and insert new chunks
-                    processed = await self.process_file(file_path, replace_existing=True)
+                processed = await _process_with_error_handling(file_path, 'update')
+                if processed:
                     results['updated'].append(processed)
-                except Exception as e:
-                    error_info = {'file_path': file_path, 'error': str(e)}
-                    results['errors'].append(error_info)
-                    print(f"✗ Failed to update {file_path}: {e}")
         
         # Process deletes (removed files)
         if to_delete:
@@ -498,8 +477,7 @@ class EmbeddingProcessor:
                         'chunks_deleted': deleted_count
                     })
                 except Exception as e:
-                    error_info = {'file_path': file_path, 'error': str(e)}
-                    results['errors'].append(error_info)
+                    results['errors'].append({'file_path': file_path, 'error': str(e)})
                     print(f"✗ Failed to delete embeddings for {file_path}: {e}")
         
         # Summary
@@ -515,6 +493,27 @@ class EmbeddingProcessor:
     def close(self):
         """Close MongoDB connection."""
         self.mongo_client.close()
+
+
+def _create_processor(
+    mongodb_uri: Optional[str] = None,
+    db_name: Optional[str] = None,
+    collection_name: Optional[str] = None,
+    openrouter_api_key: Optional[str] = None,
+    openrouter_base_url: Optional[str] = None,
+    chunk_size: int = CHUNK_SIZE,
+    chunk_overlap: int = CHUNK_OVERLAP
+) -> EmbeddingProcessor:
+    """Helper to create EmbeddingProcessor with defaults."""
+    return EmbeddingProcessor(
+        mongodb_uri=mongodb_uri or MONGODB_URI,
+        db_name=db_name or MONGODB_DB_NAME,
+        collection_name=collection_name or MONGODB_COLLECTION_NAME,
+        openrouter_api_key=openrouter_api_key,
+        openrouter_base_url=openrouter_base_url or OPENROUTER_BASE_URL,
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap
+    )
 
 
 async def process_embeddings_step(
@@ -546,23 +545,17 @@ async def process_embeddings_step(
     Returns:
         List of processing results for each file
     """
-    processor = EmbeddingProcessor(
-        mongodb_uri=mongodb_uri or MONGODB_URI,
-        db_name=db_name or MONGODB_DB_NAME,
-        collection_name=collection_name or MONGODB_COLLECTION_NAME,
-        openrouter_api_key=openrouter_api_key,
-        openrouter_base_url=openrouter_base_url or OPENROUTER_BASE_URL,
-        chunk_size=chunk_size,
-        chunk_overlap=chunk_overlap
+    processor = _create_processor(
+        mongodb_uri, db_name, collection_name, openrouter_api_key,
+        openrouter_base_url, chunk_size, chunk_overlap
     )
     
     try:
-        results = await processor.process_directory(
+        return await processor.process_directory(
             directory=directory,
             file_extensions=file_extensions,
             replace_existing=replace_existing
         )
-        return results
     finally:
         processor.close()
 
@@ -600,22 +593,16 @@ async def sync_embeddings_step(
     Returns:
         Dict with sync results: {'inserted': [], 'updated': [], 'deleted': [], 'errors': []}
     """
-    processor = EmbeddingProcessor(
-        mongodb_uri=mongodb_uri or MONGODB_URI,
-        db_name=db_name or MONGODB_DB_NAME,
-        collection_name=collection_name or MONGODB_COLLECTION_NAME,
-        openrouter_api_key=openrouter_api_key,
-        openrouter_base_url=openrouter_base_url or OPENROUTER_BASE_URL,
-        chunk_size=chunk_size,
-        chunk_overlap=chunk_overlap
+    processor = _create_processor(
+        mongodb_uri, db_name, collection_name, openrouter_api_key,
+        openrouter_base_url, chunk_size, chunk_overlap
     )
     
     try:
-        results = await processor.sync_embeddings(
+        return await processor.sync_embeddings(
             directory=directory,
             file_extensions=file_extensions
         )
-        return results
     finally:
         processor.close()
 

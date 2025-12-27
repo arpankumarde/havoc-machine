@@ -100,8 +100,9 @@ class DriveWatcher:
                     self.page_token = state.get('page_token')
                     self.known_files = state.get('known_files', {})
                     self.local_files = state.get('local_files', {})
-            except:
-                pass
+            except (pickle.PickleError, IOError, KeyError, EOFError) as e:
+                print(f"⚠️  Failed to load state: {e}")
+                # Continue with empty state
     
     async def _save_state(self):
         async with self._lock:
@@ -134,12 +135,12 @@ class DriveWatcher:
     async def _run_api_call(self, func, *args):
         """Run API call in executor with lock to ensure thread safety."""
         async with self._api_lock:
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             return await loop.run_in_executor(self._executor, func, *args)
     
     async def _run_file_io(self, func, *args):
         """Run file I/O in parallel executor."""
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         return await loop.run_in_executor(self._file_executor, func, *args)
     
     @retry_async()
@@ -274,8 +275,10 @@ class DriveWatcher:
                         old_mtime = self.known_files[file_id].get('modifiedTime')
                         new_mtime = file_data.get('modifiedTime')
                         if old_mtime != new_mtime:
-                            if file_name in self.local_files and os.path.exists(file_path):
-                                local_mtime = os.path.getmtime(file_path)
+                            # Check file existence asynchronously
+                            file_exists = await self._run_file_io(os.path.exists, file_path)
+                            if file_name in self.local_files and file_exists:
+                                local_mtime = await self._run_file_io(os.path.getmtime, file_path)
                                 local_stored_mtime = self.local_files[file_name].get('mtime', 0)
                                 if local_mtime > local_stored_mtime:
                                     print(f"⚠️  Conflict: {file_name} (Drive wins, overwriting local)")
@@ -330,7 +333,8 @@ class DriveWatcher:
                         self.known_files[item['id']] = item
                         file_name = item.get('name')
                         file_path = os.path.join(self.download_dir, file_name)
-                        if os.path.exists(file_path):
+                        file_exists = await self._run_file_io(os.path.exists, file_path)
+                        if file_exists:
                             mtime = await self._run_file_io(os.path.getmtime, file_path)
                             self.local_files[file_name] = {'file_id': item['id'], 'mtime': mtime}
                         else:
@@ -354,8 +358,9 @@ class DriveWatcher:
             
             self.page_token = await self._run_api_call(_get_start_token)
             await self._save_state()
-        except:
-            pass
+        except (HttpError, Exception) as e:
+            print(f"⚠️  Failed to get start page token: {e}")
+            # Continue without page token - will use full sync next time
         print(f"✓ Found {len(self.known_files)} files on Drive, {len(self.local_files)} local files")
         return self
     
@@ -401,12 +406,13 @@ class DriveWatcher:
                 await self._save_state()
             
             # Check for deleted local files
+            deleted_files = []
             async with self._lock:
-                deleted_files = [
-                    (file_name, self.local_files[file_name].get('file_id'))
-                    for file_name in list(self.local_files.keys())
-                    if not os.path.exists(os.path.join(self.download_dir, file_name))
-                ]
+                for file_name in list(self.local_files.keys()):
+                    file_path = os.path.join(self.download_dir, file_name)
+                    file_exists = await self._run_file_io(os.path.exists, file_path)
+                    if not file_exists:
+                        deleted_files.append((file_name, self.local_files[file_name].get('file_id')))
             
             delete_tasks = []
             for file_name, file_id in deleted_files:
