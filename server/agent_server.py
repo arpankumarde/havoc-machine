@@ -556,6 +556,95 @@ async def get_adversarial_status(group_id: str):
     }
 
 
+@app.get("/api/session/{session_id}/messages")
+async def get_session_messages(session_id: str):
+    """
+    Get all messages for a specific session in descending order (newest first).
+    
+    Uses pymongo directly to query the MongoDB memory collection (no langchain).
+    
+    Parameters:
+    - session_id: The session ID to retrieve messages for
+    
+    Returns:
+    - session_id: The session ID
+    - message_count: Total number of messages
+    - messages: Array of messages sorted by timestamp descending (newest first)
+      Each message contains:
+      - timestamp: ISO format timestamp
+      - type: "human" or "ai"
+      - content: The message content (input for human, output for ai)
+    
+    Example response:
+    {
+        "session_id": "test-session-1",
+        "message_count": 4,
+        "messages": [
+            {
+                "timestamp": "2025-12-27T12:34:56.789000",
+                "type": "ai",
+                "content": "This is the AI response..."
+            },
+            {
+                "timestamp": "2025-12-27T12:34:55.123000",
+                "type": "human",
+                "content": "What is the question?"
+            }
+        ]
+    }
+    """
+    try:
+        # Query MongoDB directly using pymongo (no langchain)
+        # Sort by timestamp descending (newest first)
+        cursor = memory_collection.find(
+            {'session_id': session_id}
+        ).sort('timestamp', -1)  # -1 for descending order (newest first)
+        
+        messages = []
+        for doc in cursor:
+            # Handle timestamp conversion
+            timestamp = doc.get('timestamp')
+            if isinstance(timestamp, datetime):
+                timestamp_str = timestamp.isoformat()
+            elif timestamp:
+                timestamp_str = str(timestamp)
+            else:
+                timestamp_str = datetime.utcnow().isoformat()
+            
+            message = {
+                'timestamp': timestamp_str,
+                'type': doc.get('type', 'unknown')
+            }
+            
+            # Get content based on message type
+            # Human messages have 'input', AI messages have 'output'
+            if doc.get('input'):
+                message['content'] = doc['input']
+                message['type'] = 'human'
+            elif doc.get('output'):
+                message['content'] = doc['output']
+                message['type'] = 'ai'
+            else:
+                # Skip if no content
+                continue
+            
+            messages.append(message)
+        
+        return {
+            'session_id': session_id,
+            'message_count': len(messages),
+            'messages': messages
+        }
+    
+    except Exception as e:
+        return {
+            'session_id': session_id,
+            'error': str(e),
+            'message_count': 0,
+            'messages': []
+        }
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
