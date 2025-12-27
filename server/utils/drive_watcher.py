@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
-"""Async Google Drive watcher for .pdf and .md files using page tokens."""
+"""Async Google Drive watcher utility for .pdf and .md files using page tokens.
+Can be used as a step in a linear pipeline."""
 
 import os
-import sys
 import asyncio
 import pickle
 from pathlib import Path
 from typing import Optional, Dict, List
 from functools import wraps
-import time
 from concurrent.futures import ThreadPoolExecutor
 
 import json
@@ -55,10 +54,18 @@ def retry_async(max_retries=MAX_RETRIES, delay=RETRY_DELAY):
 
 
 class DriveWatcher:
-    def __init__(self, folder_id: str, auth_file: str = GCP_AUTH, download_dir: str = DOWNLOAD_DIR):
+    """Google Drive watcher that syncs files between Drive and local directory.
+    
+    Can be used as a step in a linear pipeline by calling watch() or initialize() methods.
+    """
+    
+    def __init__(self, folder_id: str, auth_file: str = GCP_AUTH, download_dir: str = DOWNLOAD_DIR, 
+                 state_file: str = STATE_FILE, poll_interval: int = POLL_INTERVAL):
         self.folder_id = folder_id
         self.auth_file = auth_file
         self.download_dir = download_dir
+        self.state_file = state_file
+        self.poll_interval = poll_interval
         self.service = None
         self.page_token: Optional[str] = None
         self.known_files: Dict[str, Dict] = {}
@@ -86,9 +93,9 @@ class DriveWatcher:
         self.service = build('drive', 'v3', credentials=creds)
     
     def _load_state(self):
-        if os.path.exists(STATE_FILE):
+        if os.path.exists(self.state_file):
             try:
-                with open(STATE_FILE, 'rb') as f:
+                with open(self.state_file, 'rb') as f:
                     state = pickle.load(f)
                     self.page_token = state.get('page_token')
                     self.known_files = state.get('known_files', {})
@@ -106,7 +113,7 @@ class DriveWatcher:
     
     def _save_state_sync(self):
         try:
-            with open(STATE_FILE, 'wb') as f:
+            with open(self.state_file, 'wb') as f:
                 pickle.dump({
                     'page_token': self.page_token,
                     'known_files': self.known_files,
@@ -298,6 +305,11 @@ class DriveWatcher:
             print(f"✗ Error checking changes: {e}")
     
     async def initialize(self):
+        """Initialize the watcher by syncing existing files from Drive.
+        
+        Returns:
+            DriveWatcher: Returns self for pipeline chaining
+        """
         print(f"🔍 Initializing folder: {self.folder_id}")
         page_token = None
         download_tasks = []
@@ -345,6 +357,7 @@ class DriveWatcher:
         except:
             pass
         print(f"✓ Found {len(self.known_files)} files on Drive, {len(self.local_files)} local files")
+        return self
     
     async def _check_local_changes(self):
         """Check for local file changes and sync to Drive."""
@@ -429,8 +442,26 @@ class DriveWatcher:
             print(f"✗ Delete from Drive error: {file_name} - {e}")
             raise
     
+    async def sync_once(self):
+        """Perform a single sync operation (check changes once).
+        
+        Returns:
+            DriveWatcher: Returns self for pipeline chaining
+        """
+        await asyncio.gather(
+            self._check_changes(),  # Drive -> Local
+            self._check_local_changes(),  # Local -> Drive
+            return_exceptions=True
+        )
+        return self
+    
     async def watch(self):
-        print(f"👀 Watching (every {POLL_INTERVAL}s)...")
+        """Continuously watch for changes (runs indefinitely).
+        
+        Returns:
+            DriveWatcher: Returns self for pipeline chaining (after interruption)
+        """
+        print(f"👀 Watching (every {self.poll_interval}s)...")
         try:
             while True:
                 await asyncio.gather(
@@ -438,27 +469,48 @@ class DriveWatcher:
                     self._check_local_changes(),  # Local -> Drive
                     return_exceptions=True
                 )
-                await asyncio.sleep(POLL_INTERVAL)
+                await asyncio.sleep(self.poll_interval)
         except KeyboardInterrupt:
             print("\n🛑 Stopped")
             await self._save_state()
+        return self
 
 
-async def main_async():
-    folder_id = os.getenv("WATCH_FOLDER_ID") or (sys.argv[1] if len(sys.argv) > 1 else None)
-    if not folder_id:
-        print("Usage: python drive_watcher.py <FOLDER_ID>")
-        print("   or: Set WATCH_FOLDER_ID in .env file")
-        sys.exit(1)
+async def watch_drive_step(folder_id: str, auth_file: str = GCP_AUTH, 
+                          download_dir: str = DOWNLOAD_DIR, 
+                          state_file: str = STATE_FILE,
+                          poll_interval: int = POLL_INTERVAL,
+                          initialize: bool = True,
+                          watch: bool = False):
+    """Pipeline step function to watch Google Drive folder.
     
-    watcher = DriveWatcher(folder_id, os.getenv("GCP_AUTH", GCP_AUTH))
-    await watcher.initialize()
-    await watcher.watch()
+    Args:
+        folder_id: Google Drive folder ID to watch
+        auth_file: Path to Google service account JSON file
+        download_dir: Local directory to sync files to
+        state_file: Path to state persistence file
+        poll_interval: Seconds between sync checks
+        initialize: Whether to initialize and sync existing files first
+        watch: Whether to continuously watch (True) or sync once (False)
+    
+    Returns:
+        DriveWatcher: The watcher instance for further pipeline steps
+    """
+    watcher = DriveWatcher(
+        folder_id=folder_id,
+        auth_file=auth_file,
+        download_dir=download_dir,
+        state_file=state_file,
+        poll_interval=poll_interval
+    )
+    
+    if initialize:
+        await watcher.initialize()
+    
+    if watch:
+        await watcher.watch()
+    else:
+        await watcher.sync_once()
+    
+    return watcher
 
-
-def main():
-    asyncio.run(main_async())
-
-
-if __name__ == "__main__":
-    main()
