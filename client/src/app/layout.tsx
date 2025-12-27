@@ -14,7 +14,8 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "NextJs Starter Kit",
+  title: "Havoc Machine - Synthetic Customer Chaos Lab",
+  description: "Stress-test customer support systems through AI-generated adversarial conversations that expose policy vulnerabilities, refund leakage, and chatbot weaknesses.",
 };
 
 export default function RootLayout({
