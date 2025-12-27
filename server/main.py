@@ -6,7 +6,7 @@ import asyncio
 import sys
 from dotenv import load_dotenv
 
-from utils import watch_drive_step, process_embeddings_step
+from utils import watch_drive_step, sync_embeddings_step
 
 load_dotenv()
 
@@ -40,24 +40,22 @@ async def main():
         print(f"❌ Error fetching files: {e}")
         sys.exit(1)
     
-    # Step 2: Process files and create embeddings
-    print(f"\n🧠 Step 2: Processing files and creating embeddings...")
+    # Step 2: Sync embeddings (insert new, update changed, delete removed)
+    print(f"\n🧠 Step 2: Syncing embeddings with files...")
     try:
-        results = await process_embeddings_step(
-            directory=DOWNLOAD_DIR,
-            replace_existing=True  # Upsert: replace existing embeddings
+        results = await sync_embeddings_step(
+            directory=DOWNLOAD_DIR
         )
         
         # Summary
-        successful = [r for r in results if 'error' not in r]
-        failed = [r for r in results if 'error' in r]
-        
         print(f"\n✓ Pipeline completed!")
-        print(f"  • Successfully processed: {len(successful)} files")
-        if failed:
-            print(f"  • Failed: {len(failed)} files")
-            for result in failed:
-                print(f"    - {result.get('file_path', 'unknown')}: {result.get('error')}")
+        print(f"  • Inserted: {len(results['inserted'])} files")
+        print(f"  • Updated: {len(results['updated'])} files")
+        print(f"  • Deleted: {len(results['deleted'])} files")
+        if results['errors']:
+            print(f"  • Errors: {len(results['errors'])} files")
+            for error in results['errors']:
+                print(f"    - {error.get('file_path', 'unknown')}: {error.get('error')}")
     except ConnectionError as e:
         print(str(e))
         sys.exit(1)

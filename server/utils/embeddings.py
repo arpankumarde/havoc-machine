@@ -175,7 +175,8 @@ class EmbeddingProcessor:
     
     async def _process_file(self, file_path: str) -> Dict[str, Any]:
         """Process a single file and return chunks with metadata."""
-        file_path_obj = Path(file_path)
+        file_path_obj = Path(file_path).resolve()  # Normalize to absolute path
+        file_path = str(file_path_obj)  # Use normalized path
         file_ext = file_path_obj.suffix.lower()
         
         print(f"📄 Processing: {file_path_obj.name}")
@@ -337,6 +338,180 @@ class EmbeddingProcessor:
             chunk['_id'] = str(chunk['_id'])
         return chunks
     
+    def delete_embeddings_for_file(self, file_path: str) -> int:
+        """Delete all embeddings/chunks for a specific file.
+        
+        Args:
+            file_path: Path to the file whose embeddings should be deleted
+        
+        Returns:
+            Number of chunks deleted
+        """
+        result = self.collection.delete_many({"file_path": file_path})
+        deleted_count = result.deleted_count
+        if deleted_count > 0:
+            print(f"  🗑️  Deleted {deleted_count} chunks for {Path(file_path).name}")
+        return deleted_count
+    
+    def get_processed_files(self) -> Dict[str, Dict[str, Any]]:
+        """Get all processed files from MongoDB with their hashes.
+        
+        Returns:
+            Dict mapping file_path to file metadata (file_hash, file_name, etc.)
+        """
+        # Get unique file_paths with their latest hash
+        pipeline = [
+            {"$group": {
+                "_id": "$file_path",
+                "file_hash": {"$first": "$file_hash"},
+                "file_name": {"$first": "$file_name"},
+                "file_size": {"$first": "$file_size"},
+                "total_chunks": {"$first": "$total_chunks"}
+            }}
+        ]
+        
+        processed_files = {}
+        for doc in self.collection.aggregate(pipeline):
+            file_path = doc['_id']
+            processed_files[file_path] = {
+                'file_hash': doc.get('file_hash'),
+                'file_name': doc.get('file_name'),
+                'file_size': doc.get('file_size'),
+                'total_chunks': doc.get('total_chunks')
+            }
+        
+        return processed_files
+    
+    async def sync_embeddings(
+        self,
+        directory: str,
+        file_extensions: Optional[List[str]] = None
+    ) -> Dict[str, Any]:
+        """Sync embeddings with files in directory: insert new, update changed, delete removed.
+        
+        This method keeps embeddings in sync with the directory, treating the directory
+        as the single source of truth.
+        
+        Args:
+            directory: Directory path to sync
+            file_extensions: List of file extensions to process (default: ['.pdf', '.md'])
+        
+        Returns:
+            Dict with sync results: {'inserted': [], 'updated': [], 'deleted': [], 'errors': []}
+        """
+        if file_extensions is None:
+            file_extensions = ['.pdf', '.md']
+        
+        directory_path = Path(directory)
+        if not directory_path.exists():
+            raise FileNotFoundError(f"Directory not found: {directory}")
+        
+        # Get all processed files from MongoDB
+        processed_files = self.get_processed_files()
+        print(f"📊 Found {len(processed_files)} processed files in database")
+        
+        # Get all files in directory (normalize to absolute paths)
+        local_files = {}
+        directory_abs = directory_path.resolve()
+        for file_path in directory_abs.iterdir():
+            if file_path.is_file() and file_path.suffix.lower() in file_extensions:
+                file_path_str = str(file_path.resolve())  # Normalize to absolute path
+                local_files[file_path_str] = {
+                    'file_path': file_path_str,
+                    'file_name': file_path.name,
+                    'exists': True
+                }
+        
+        print(f"📁 Found {len(local_files)} files in directory")
+        
+        # Determine what needs to be done
+        to_insert = []  # New files
+        to_update = []  # Changed files (hash mismatch)
+        to_delete = []  # Files in DB but not in directory
+        
+        # Check local files
+        for file_path, file_info in local_files.items():
+            if file_path not in processed_files:
+                # New file - needs to be inserted
+                to_insert.append(file_path)
+            else:
+                # File exists in DB - check if it changed
+                current_hash = self._get_file_hash(file_path)
+                stored_hash = processed_files[file_path].get('file_hash')
+                if current_hash != stored_hash:
+                    # File changed - needs to be updated
+                    to_update.append(file_path)
+        
+        # Check for deleted files (in DB but not in directory)
+        for file_path in processed_files.keys():
+            if file_path not in local_files:
+                to_delete.append(file_path)
+        
+        print(f"\n🔄 Sync plan:")
+        print(f"  • New files: {len(to_insert)}")
+        print(f"  • Updated files: {len(to_update)}")
+        print(f"  • Deleted files: {len(to_delete)}")
+        
+        results = {
+            'inserted': [],
+            'updated': [],
+            'deleted': [],
+            'errors': []
+        }
+        
+        # Process inserts (new files)
+        if to_insert:
+            print(f"\n✨ Processing {len(to_insert)} new files...")
+            for file_path in to_insert:
+                try:
+                    processed = await self.process_file(file_path, replace_existing=True)
+                    results['inserted'].append(processed)
+                except Exception as e:
+                    error_info = {'file_path': file_path, 'error': str(e)}
+                    results['errors'].append(error_info)
+                    print(f"✗ Failed to process {file_path}: {e}")
+        
+        # Process updates (changed files)
+        if to_update:
+            print(f"\n📝 Processing {len(to_update)} updated files...")
+            for file_path in to_update:
+                try:
+                    # Delete old chunks first
+                    self.delete_embeddings_for_file(file_path)
+                    # Process and insert new chunks
+                    processed = await self.process_file(file_path, replace_existing=True)
+                    results['updated'].append(processed)
+                except Exception as e:
+                    error_info = {'file_path': file_path, 'error': str(e)}
+                    results['errors'].append(error_info)
+                    print(f"✗ Failed to update {file_path}: {e}")
+        
+        # Process deletes (removed files)
+        if to_delete:
+            print(f"\n🗑️  Processing {len(to_delete)} deleted files...")
+            for file_path in to_delete:
+                try:
+                    deleted_count = self.delete_embeddings_for_file(file_path)
+                    results['deleted'].append({
+                        'file_path': file_path,
+                        'file_name': processed_files[file_path].get('file_name', Path(file_path).name),
+                        'chunks_deleted': deleted_count
+                    })
+                except Exception as e:
+                    error_info = {'file_path': file_path, 'error': str(e)}
+                    results['errors'].append(error_info)
+                    print(f"✗ Failed to delete embeddings for {file_path}: {e}")
+        
+        # Summary
+        print(f"\n✓ Sync completed!")
+        print(f"  • Inserted: {len(results['inserted'])} files")
+        print(f"  • Updated: {len(results['updated'])} files")
+        print(f"  • Deleted: {len(results['deleted'])} files")
+        if results['errors']:
+            print(f"  • Errors: {len(results['errors'])} files")
+        
+        return results
+    
     def close(self):
         """Close MongoDB connection."""
         self.mongo_client.close()
@@ -386,6 +561,59 @@ async def process_embeddings_step(
             directory=directory,
             file_extensions=file_extensions,
             replace_existing=replace_existing
+        )
+        return results
+    finally:
+        processor.close()
+
+
+async def sync_embeddings_step(
+    directory: str,
+    mongodb_uri: Optional[str] = None,
+    db_name: Optional[str] = None,
+    collection_name: Optional[str] = None,
+    openrouter_api_key: Optional[str] = None,
+    openrouter_base_url: Optional[str] = None,
+    file_extensions: Optional[List[str]] = None,
+    chunk_size: int = CHUNK_SIZE,
+    chunk_overlap: int = CHUNK_OVERLAP
+) -> Dict[str, Any]:
+    """Pipeline step function to sync embeddings with directory (insert, update, delete).
+    
+    This keeps embeddings in sync with the directory, treating the directory as the
+    single source of truth. It will:
+    - Insert embeddings for new files
+    - Update embeddings for changed files (detected by hash)
+    - Delete embeddings for removed files
+    
+    Args:
+        directory: Directory containing files to sync
+        mongodb_uri: MongoDB connection URI
+        db_name: MongoDB database name
+        collection_name: MongoDB collection name
+        openrouter_api_key: OpenRouter API key (uses env var if not provided)
+        openrouter_base_url: OpenRouter base URL
+        file_extensions: List of file extensions to process (default: ['.pdf', '.md'])
+        chunk_size: Size of text chunks
+        chunk_overlap: Overlap between chunks
+    
+    Returns:
+        Dict with sync results: {'inserted': [], 'updated': [], 'deleted': [], 'errors': []}
+    """
+    processor = EmbeddingProcessor(
+        mongodb_uri=mongodb_uri or MONGODB_URI,
+        db_name=db_name or MONGODB_DB_NAME,
+        collection_name=collection_name or MONGODB_COLLECTION_NAME,
+        openrouter_api_key=openrouter_api_key,
+        openrouter_base_url=openrouter_base_url or OPENROUTER_BASE_URL,
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap
+    )
+    
+    try:
+        results = await processor.sync_embeddings(
+            directory=directory,
+            file_extensions=file_extensions
         )
         return results
     finally:
