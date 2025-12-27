@@ -5,7 +5,7 @@ import Link from "next/link";
 import { Button } from "@/components/ui/button";
 import { Zap, LayoutDashboard, Home, Play, LogOut } from "lucide-react";
 import { Streamdown } from "streamdown";
-
+import Image from "next/image";
 const RunPage = () => {
   const router = useRouter();
 
@@ -168,9 +168,16 @@ const RunPage = () => {
       <aside className="w-20 bg-[#252525] border-r border-[#B91C1C]/20 flex flex-col fixed h-screen">
         {/* Logo */}
         <div className="p-4 border-b border-[#B91C1C]/20 flex justify-center">
-          <div className="w-10 h-10 bg-[#B91C1C] flex items-center justify-center">
-            <Zap className="w-6 h-6 text-white" />
-          </div>
+        <div className="w-10 h-10 flex items-center justify-center">
+  <Image
+    src="/logo.png"
+    alt="Logo"
+    width={32}
+    height={32}
+    className="object-contain"
+  />
+</div>
+
         </div>
 
         {/* Navigation Icons */}

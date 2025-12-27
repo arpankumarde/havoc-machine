@@ -5,8 +5,8 @@ import { useRouter } from "next/navigation";
 import Link from "next/link";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import Image from "next/image";
 import {
-    Zap,
     BarChart3,
     Shield,
     Users,
@@ -45,9 +45,16 @@ const DashboardPage = () => {
             <nav className="border-b border-[#B91C1C]/20 bg-[#1E1E1E]/80 backdrop-blur-sm sticky top-0 z-50">
                 <div className="container mx-auto px-8 py-5 flex items-center justify-between">
                     <div className="flex items-center gap-3">
-                        <div className="w-10 h-10 bg-[#B91C1C] flex items-center justify-center">
-                            <Zap className="w-6 h-6 text-white" />
-                        </div>
+                    <div className="w-10 h-10 flex items-center justify-center">
+  <Image
+    src="/logo.png"
+    alt="Logo"
+    width={32}
+    height={32}
+    className="object-contain"
+  />
+</div>
+
                         <span className="text-2xl font-bold text-white cursor-pointer" onClick={() => router.push("/")}>HAVOC MACHINE</span>
                     </div>
                     <div className="flex items-center gap-6">
