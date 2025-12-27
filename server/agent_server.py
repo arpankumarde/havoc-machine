@@ -6,8 +6,9 @@ import asyncio
 from typing import Dict, List, Optional
 from datetime import datetime
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, BackgroundTasks
 from fastapi.responses import HTMLResponse
+from pydantic import BaseModel
 from dotenv import load_dotenv
 from pymongo import MongoClient
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
@@ -405,6 +406,154 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
     finally:
         if session_id in active_connections:
             del active_connections[session_id]
+
+
+# Pydantic models for API requests
+class ParallelAdversarialRequest(BaseModel):
+    websocket_url: str
+    parallel_executions: int
+    duration_minutes: float
+    adversarial_model: Optional[str] = None
+    judge_model: Optional[str] = None
+
+
+class ParallelAdversarialResponse(BaseModel):
+    group_id: str
+    session_ids: List[str]
+    status: str
+    message: str
+
+
+# Background task storage
+running_tasks: Dict[str, asyncio.Task] = {}
+
+
+async def run_parallel_adversarial_background(
+    websocket_url: str,
+    parallel_executions: int,
+    duration_minutes: float,
+    group_id: str,
+    adversarial_model: Optional[str] = None,
+    judge_model: Optional[str] = None
+):
+    """Run parallel adversarial testing in the background"""
+    try:
+        from parallel_adversarial import run_parallel_adversarial
+        
+        result = await run_parallel_adversarial(
+            websocket_base_url=websocket_url,
+            parallel_executions=parallel_executions,
+            duration_minutes=duration_minutes,
+            adversarial_model=adversarial_model,
+            judge_model=judge_model,
+            group_id=group_id
+        )
+        
+        print(f"✅ Parallel adversarial test completed for group {group_id}")
+        print(f"   Session IDs: {result['session_ids']}")
+        print(f"   Reports saved: {result['consolidated_report_paths']}")
+        
+    except Exception as e:
+        print(f"❌ Error in parallel adversarial test for group {group_id}: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        # Remove task from running tasks
+        if group_id in running_tasks:
+            del running_tasks[group_id]
+
+
+@app.post("/api/adversarial/parallel", response_model=ParallelAdversarialResponse)
+async def start_parallel_adversarial(request: ParallelAdversarialRequest, background_tasks: BackgroundTasks):
+    """
+    Start parallel adversarial testing with multiple agents.
+    
+    This endpoint spins up multiple adversarial agents in parallel, each focusing on different topics
+    to better exploit vulnerabilities. Agents run in the background and generate a consolidated
+    report when complete.
+    
+    Parameters:
+    - websocket_url: Base WebSocket URL for the agent server (e.g., "ws://localhost:8000" or "ws://localhost:8000/ws")
+                     The session_id will be appended automatically
+    - parallel_executions: Number of parallel agents to run (each will focus on a different topic)
+    - duration_minutes: Duration of the test in minutes
+    - adversarial_model: (Optional) Model for generating adversarial queries
+    - judge_model: (Optional) Model for analyzing responses
+    
+    Returns:
+    - group_id: Unique identifier for this test group (used in report filename with "grp-" prefix)
+    - session_ids: List of session IDs for all agents (can be used to check chat history via WebSocket)
+    - status: "started" if successful
+    - message: Status message
+    
+    Example request:
+    {
+        "websocket_url": "ws://localhost:8000",
+        "parallel_executions": 3,
+        "duration_minutes": 5
+    }
+    
+    The consolidated report will be saved as: grp-{group_id}_{timestamp}.md and .json
+    """
+    import uuid
+    from datetime import datetime
+    
+    # Validate inputs
+    if request.parallel_executions < 1:
+        return ParallelAdversarialResponse(
+            group_id="",
+            session_ids=[],
+            status="error",
+            message="parallel_executions must be at least 1"
+        )
+    
+    if request.duration_minutes <= 0:
+        return ParallelAdversarialResponse(
+            group_id="",
+            session_ids=[],
+            status="error",
+            message="duration_minutes must be greater than 0"
+        )
+    
+    # Generate group ID
+    group_id = f"grp-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
+    
+    # Generate session IDs
+    session_ids = [f"{group_id}-agent-{i+1}" for i in range(request.parallel_executions)]
+    
+    # Start background task
+    # The websocket_url should be the base URL (without session_id)
+    # e.g., "ws://localhost:8000" or "ws://localhost:8000/ws"
+    task = asyncio.create_task(
+        run_parallel_adversarial_background(
+            websocket_url=request.websocket_url,
+            parallel_executions=request.parallel_executions,
+            duration_minutes=request.duration_minutes,
+            group_id=group_id,
+            adversarial_model=request.adversarial_model,
+            judge_model=request.judge_model
+        )
+    )
+    running_tasks[group_id] = task
+    
+    return ParallelAdversarialResponse(
+        group_id=group_id,
+        session_ids=session_ids,
+        status="started",
+        message=f"Started {request.parallel_executions} parallel adversarial agents. They will run for {request.duration_minutes} minutes."
+    )
+
+
+@app.get("/api/adversarial/status/{group_id}")
+async def get_adversarial_status(group_id: str):
+    """Check if adversarial testing is still running"""
+    is_running = group_id in running_tasks and not running_tasks[group_id].done()
+    
+    return {
+        "group_id": group_id,
+        "status": "running" if is_running else "completed",
+        "is_running": is_running
+    }
 
 
 if __name__ == "__main__":

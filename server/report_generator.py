@@ -3,7 +3,7 @@
 import os
 import json
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Dict, Any
 from datetime import datetime
 from adversarial_agent import AdversarialReport, VulnerabilityType
 
@@ -370,3 +370,147 @@ class ReportGenerator:
         md_path = self.save_report(report, format="markdown")
         json_path = self.save_report(report, format="json")
         return md_path, json_path
+    
+    def save_consolidated_report(self, consolidated_data: Dict[str, Any], group_id: str) -> tuple[str, str]:
+        """Save consolidated report from multiple agents"""
+        timestamp = consolidated_data["start_time"].strftime('%Y%m%d-%H%M%S')
+        filename = f"grp-{group_id}_{timestamp}"
+        
+        # Convert ConversationTurn objects to dicts for JSON serialization
+        json_data = consolidated_data.copy()
+        if "vulnerabilities_found" in json_data:
+            json_data["vulnerabilities_found"] = [
+                {
+                    "timestamp": turn.timestamp.isoformat(),
+                    "adversarial_query": turn.adversarial_query,
+                    "agent_response": turn.agent_response,
+                    "sources": turn.sources,
+                    "vulnerability_type": turn.vulnerability_detected.value if turn.vulnerability_detected else None,
+                    "vulnerability_details": turn.vulnerability_details,
+                    "risk_score": turn.risk_score,
+                    "response_time_ms": turn.response_time_ms,
+                    "query_generation_time_ms": turn.query_generation_time_ms,
+                    "analysis_time_ms": turn.analysis_time_ms
+                }
+                for turn in json_data["vulnerabilities_found"]
+            ]
+        if "conversation_history" in json_data:
+            json_data["conversation_history"] = [
+                {
+                    "timestamp": turn.timestamp.isoformat(),
+                    "adversarial_query": turn.adversarial_query,
+                    "agent_response": turn.agent_response,
+                    "sources": turn.sources,
+                    "vulnerability_type": turn.vulnerability_detected.value if turn.vulnerability_detected else None,
+                    "vulnerability_details": turn.vulnerability_details,
+                    "risk_score": turn.risk_score,
+                    "response_time_ms": turn.response_time_ms,
+                    "query_generation_time_ms": turn.query_generation_time_ms,
+                    "analysis_time_ms": turn.analysis_time_ms
+                }
+                for turn in json_data["conversation_history"]
+            ]
+        # Convert datetime objects to ISO format strings
+        json_data["start_time"] = consolidated_data["start_time"].isoformat()
+        json_data["end_time"] = consolidated_data["end_time"].isoformat()
+        
+        # Save JSON format
+        json_path = self.output_dir / f"{filename}.json"
+        json_path.write_text(json.dumps(json_data, indent=2, default=str), encoding='utf-8')
+        
+        # Generate and save markdown format
+        md_content = self.generate_consolidated_markdown(consolidated_data)
+        md_path = self.output_dir / f"{filename}.md"
+        md_path.write_text(md_content, encoding='utf-8')
+        
+        return str(md_path), str(json_path)
+    
+    def generate_consolidated_markdown(self, consolidated_data: Dict[str, Any]) -> str:
+        """Generate markdown report for consolidated results"""
+        lines = []
+        
+        # Header
+        lines.append("# Consolidated Adversarial Test Report")
+        lines.append("")
+        lines.append(f"**Group ID:** `{consolidated_data['group_id']}`")
+        lines.append(f"**Test Duration:** {consolidated_data['duration_minutes']:.2f} minutes")
+        lines.append(f"**Start Time:** {consolidated_data['start_time'].strftime('%Y-%m-%d %H:%M:%S')}")
+        lines.append(f"**End Time:** {consolidated_data['end_time'].strftime('%Y-%m-%d %H:%M:%S')}")
+        lines.append(f"**Total Agents:** {consolidated_data['total_agents']}")
+        lines.append(f"**Total Conversation Turns:** {consolidated_data['total_turns']}")
+        lines.append(f"**Session IDs:** {', '.join(consolidated_data['session_ids'])}")
+        lines.append("")
+        
+        # Individual Agent Summary
+        lines.append("## Individual Agent Summary")
+        lines.append("")
+        lines.append("| Session ID | Turns | Vulnerabilities | Duration (min) |")
+        lines.append("|------------|-------|-----------------|----------------|")
+        for agent_report in consolidated_data['individual_reports']:
+            lines.append(f"| {agent_report['session_id']} | {agent_report['total_turns']} | {agent_report['vulnerabilities_count']} | {agent_report['duration_minutes']:.2f} |")
+        lines.append("")
+        
+        # Overall Statistics
+        lines.append("## Overall Statistics")
+        lines.append("")
+        total_vulnerabilities = len(consolidated_data['vulnerabilities_found'])
+        lines.append(f"**Total Vulnerabilities Found:** {total_vulnerabilities}")
+        lines.append("")
+        
+        if consolidated_data.get('network_stats'):
+            stats = consolidated_data['network_stats']
+            lines.append("### Network Statistics")
+            lines.append("")
+            lines.append(f"- **Average Response Time:** {stats.get('avg_response_time_ms', 0):.2f} ms")
+            lines.append(f"- **Total Requests:** {stats.get('total_requests', 0)}")
+            lines.append("")
+        
+        # Risk Summary
+        lines.append("### Risk Summary by Type")
+        lines.append("")
+        lines.append("| Vulnerability Type | Count |")
+        lines.append("|-------------------|-------|")
+        for vuln_type, count in consolidated_data['risk_summary'].items():
+            if count > 0:
+                lines.append(f"| {vuln_type.replace('_', ' ').title()} | {count} |")
+        lines.append("")
+        
+        # Vulnerabilities
+        if total_vulnerabilities > 0:
+            lines.append("## Vulnerabilities Found")
+            lines.append("")
+            # Find session ID for each vulnerability by checking which report it came from
+            # For now, we'll just show the vulnerability details
+            for i, vuln in enumerate(consolidated_data['vulnerabilities_found'][:20], 1):  # Limit to first 20
+                lines.append(f"### Vulnerability #{i}")
+                lines.append("")
+                lines.append(f"**Timestamp:** {vuln.timestamp.strftime('%Y-%m-%d %H:%M:%S')}")
+                lines.append(f"**Type:** {vuln.vulnerability_detected.value if vuln.vulnerability_detected else 'Unknown'}")
+                lines.append(f"**Risk Score:** {vuln.risk_score:.2f}/1.0")
+                lines.append("")
+                lines.append("**Query:**")
+                lines.append("```")
+                lines.append(vuln.adversarial_query)
+                lines.append("```")
+                lines.append("")
+                lines.append("**Response:**")
+                lines.append("```")
+                lines.append(vuln.agent_response[:500] + "..." if len(vuln.agent_response) > 500 else vuln.agent_response)
+                lines.append("```")
+                lines.append("")
+                if vuln.vulnerability_details:
+                    lines.append("**Analysis:**")
+                    lines.append(vuln.vulnerability_details[:300] + "..." if len(vuln.vulnerability_details) > 300 else vuln.vulnerability_details)
+                    lines.append("")
+                lines.append("---")
+                lines.append("")
+        
+        # Recommendations
+        if consolidated_data.get('recommendations'):
+            lines.append("## Recommendations")
+            lines.append("")
+            for i, rec in enumerate(consolidated_data['recommendations'], 1):
+                lines.append(f"{i}. {rec}")
+            lines.append("")
+        
+        return "\n".join(lines)

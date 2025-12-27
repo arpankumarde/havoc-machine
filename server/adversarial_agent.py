@@ -71,14 +71,20 @@ class AdversarialAgent:
         judge_model: str = JUDGE_MODEL,
         agent_host: str = AGENT_HOST,
         agent_port: int = AGENT_PORT,
-        session_id: Optional[str] = None
+        session_id: Optional[str] = None,
+        topic_focus: Optional[str] = None,
+        websocket_url: Optional[str] = None
     ):
         self.adversarial_model = adversarial_model
         self.judge_model = judge_model
         self.agent_host = agent_host
         self.agent_port = agent_port
         self.session_id = session_id or f"adversarial-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
-        self.websocket_url = f"ws://{agent_host}:{agent_port}/ws/{self.session_id}"
+        self.topic_focus = topic_focus  # Optional topic focus for this agent
+        if websocket_url:
+            self.websocket_url = websocket_url
+        else:
+            self.websocket_url = f"ws://{agent_host}:{agent_port}/ws/{self.session_id}"
         
         # Adversarial LLM - for generating aggressive queries
         self.adversarial_llm = ChatOpenAI(
@@ -148,6 +154,7 @@ Conversation history (what we've tried so far):
 
 Previous attempts: {attempt_count}
 Time remaining: {time_remaining} minutes
+{topic_focus_instruction}
 
 Generate a query that:
 1. References the KB content above
@@ -408,6 +415,11 @@ Analysis:""")
         history = self._get_conversation_summary()
         kb_excerpts = self._get_targeted_kb_excerpts()
         
+        # Add topic focus instruction if specified
+        topic_focus_instruction = ""
+        if self.topic_focus:
+            topic_focus_instruction = f"\n\nTOPIC FOCUS: Prioritize queries related to: {self.topic_focus}\nFocus your attacks on this specific area while still testing for KB drift and hallucination."
+        
         chain = self.strategy_prompt | self.adversarial_llm | StrOutputParser()
         
         query = await chain.ainvoke({
@@ -415,7 +427,8 @@ Analysis:""")
             "kb_summary": self.kb_summary,
             "kb_excerpts": kb_excerpts,
             "attempt_count": attempt_count,
-            "time_remaining": f"{time_remaining:.1f}"
+            "time_remaining": f"{time_remaining:.1f}",
+            "topic_focus_instruction": topic_focus_instruction
         })
         
         return query.strip()
