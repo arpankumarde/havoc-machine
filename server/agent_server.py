@@ -46,12 +46,15 @@ mongo_client = MongoClient(MONGODB_URI)
 db = mongo_client[MONGODB_DB_NAME]
 chunks_collection = db[MONGODB_COLLECTION_NAME]
 memory_collection = db[MEMORY_COLLECTION_NAME]
+groups_collection = db["group"]
 
 try:
     chunks_collection.create_index("embedding")
     chunks_collection.create_index("file_path")
     memory_collection.create_index("session_id")
     memory_collection.create_index([("session_id", 1), ("timestamp", -1)])
+    groups_collection.create_index("group_id", unique=True)
+    groups_collection.create_index("created_at")
     print("Created MongoDB indexes")
 except Exception as e:
     print(f"Index creation warning: {e}")
@@ -463,10 +466,35 @@ async def run_parallel_adversarial_background(
         print(f"   Session IDs: {result['session_ids']}")
         print(f"   Reports saved: {result['consolidated_report_paths']}")
         
+        # Update group document with report URLs
+        report_urls = result.get('consolidated_report_paths', {})
+        update_data = {
+            "status": "completed",
+            "completed_at": datetime.utcnow(),
+            "report_urls": {
+                "markdown": report_urls.get("markdown"),
+                "json": report_urls.get("json")
+            }
+        }
+        groups_collection.update_one(
+            {"group_id": group_id},
+            {"$set": update_data}
+        )
+        
     except Exception as e:
         print(f"❌ Error in parallel adversarial test for group {group_id}: {e}")
         import traceback
         traceback.print_exc()
+        
+        # Update group document with error status
+        groups_collection.update_one(
+            {"group_id": group_id},
+            {"$set": {
+                "status": "failed",
+                "error": str(e),
+                "completed_at": datetime.utcnow()
+            }}
+        )
     finally:
         # Remove task from running tasks
         if group_id in running_tasks:
@@ -531,6 +559,30 @@ async def start_parallel_adversarial(request: ParallelAdversarialRequest, backgr
     # Generate session IDs
     session_ids = [f"{group_id}-agent-{i+1}" for i in range(request.parallel_executions)]
     
+    # Create group document in MongoDB
+    group_doc = {
+        "_id": group_id,
+        "group_id": group_id,
+        "session_ids": session_ids,
+        "websocket_url": request.websocket_url,
+        "parallel_executions": request.parallel_executions,
+        "duration_minutes": request.duration_minutes,
+        "adversarial_model": request.adversarial_model,
+        "judge_model": request.judge_model,
+        "status": "running",
+        "created_at": datetime.utcnow(),
+        "report_urls": {
+            "markdown": None,
+            "json": None
+        }
+    }
+    
+    try:
+        groups_collection.insert_one(group_doc)
+        print(f"Created group document: {group_id}")
+    except Exception as e:
+        print(f"Warning: Failed to create group document: {e}")
+    
     # Start background task
     # The websocket_url should be the base URL (without session_id)
     # e.g., "ws://localhost:8000" or "ws://localhost:8000/ws"
@@ -564,6 +616,82 @@ async def get_adversarial_status(group_id: str):
         "status": "running" if is_running else "completed",
         "is_running": is_running
     }
+
+
+@app.get("/api/groups")
+async def get_all_groups():
+    """
+    Get all group IDs.
+    
+    Returns:
+    - A JSON array of group IDs
+    """
+    try:
+        groups = list(groups_collection.find({}, {"group_id": 1, "_id": 0}))
+        group_ids = [group["group_id"] for group in groups]
+        return group_ids
+    except Exception as e:
+        return {
+            "error": str(e),
+            "groups": []
+        }
+
+
+@app.get("/api/groups/{group_id}")
+async def get_group_metadata(group_id: str):
+    """
+    Get full metadata for a specific group.
+    
+    Parameters:
+    - group_id: The group ID to retrieve metadata for
+    
+    Returns:
+    - Full metadata object including:
+      - group_id
+      - session_ids
+      - websocket_url
+      - parallel_executions
+      - duration_minutes
+      - adversarial_model
+      - judge_model
+      - status (running, completed, failed)
+      - created_at
+      - completed_at (if completed)
+      - report_urls (markdown and json S3 URLs)
+      - error (if failed)
+    """
+    try:
+        group = groups_collection.find_one({"group_id": group_id})
+        
+        if not group:
+            return {
+                "error": f"Group {group_id} not found"
+            }
+        
+        # Convert ObjectId and datetime to strings for JSON serialization
+        result = {
+            "group_id": group.get("group_id"),
+            "session_ids": group.get("session_ids", []),
+            "websocket_url": group.get("websocket_url"),
+            "parallel_executions": group.get("parallel_executions"),
+            "duration_minutes": group.get("duration_minutes"),
+            "adversarial_model": group.get("adversarial_model"),
+            "judge_model": group.get("judge_model"),
+            "status": group.get("status", "unknown"),
+            "created_at": group.get("created_at").isoformat() if group.get("created_at") else None,
+            "completed_at": group.get("completed_at").isoformat() if group.get("completed_at") else None,
+            "report_urls": group.get("report_urls", {
+                "markdown": None,
+                "json": None
+            }),
+            "error": group.get("error")
+        }
+        
+        return result
+    except Exception as e:
+        return {
+            "error": str(e)
+        }
 
 
 @app.get("/api/session/{session_id}/messages")
