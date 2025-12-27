@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-"""WebSocket server with LangChain support agent using MongoDB knowledge base."""
 
 import os
 import json
@@ -21,7 +20,6 @@ from langchain_core.output_parsers import StrOutputParser
 
 load_dotenv()
 
-# Configuration
 MONGODB_URI = os.getenv("MONGODB_URI", "mongodb://localhost:27017/")
 MONGODB_DB_NAME = os.getenv("MONGODB_DB_NAME", "havoc_machine")
 MONGODB_COLLECTION_NAME = os.getenv("MONGODB_COLLECTION_NAME", "document_chunks")
@@ -31,51 +29,43 @@ OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/ap
 EMBEDDING_MODEL = "text-embedding-3-small"
 LLM_MODEL = "openai/gpt-4o-mini"
 
-# Initialize FastAPI
 app = FastAPI()
 
-# MongoDB connections
 mongo_client = MongoClient(MONGODB_URI)
 db = mongo_client[MONGODB_DB_NAME]
 chunks_collection = db[MONGODB_COLLECTION_NAME]
 memory_collection = db[MEMORY_COLLECTION_NAME]
 
-# Create indexes for better performance
 try:
-    chunks_collection.create_index("embedding")  # For vector search
-    chunks_collection.create_index("file_path")  # For file lookups
-    memory_collection.create_index("session_id")  # For session lookups
-    memory_collection.create_index([("session_id", 1), ("timestamp", -1)])  # For sorted queries
-    print("✓ Created MongoDB indexes")
+    chunks_collection.create_index("embedding")
+    chunks_collection.create_index("file_path")
+    memory_collection.create_index("session_id")
+    memory_collection.create_index([("session_id", 1), ("timestamp", -1)])
+    print("Created MongoDB indexes")
 except Exception as e:
-    print(f"⚠️  Index creation warning: {e}")
+    print(f"Index creation warning: {e}")
 
-# Initialize embeddings
 embeddings = OpenAIEmbeddings(
     model=EMBEDDING_MODEL,
     openai_api_key=OPENROUTER_API_KEY,
     openai_api_base=OPENROUTER_BASE_URL
 )
 
-# Active WebSocket connections (session_id -> websocket)
 active_connections: Dict[str, WebSocket] = {}
 
 
 class MongoDBChatMessageHistory(BaseChatMessageHistory):
-    """MongoDB-backed chat message history for conversation."""
-    
     def __init__(self, session_id: str):
         self.session_id = session_id
         self.collection = memory_collection
     
     @property
     def messages(self):
-        """Load messages from MongoDB."""
         from langchain_core.messages import HumanMessage, AIMessage
         
         history_docs = list(self.collection.find(
             {'session_id': self.session_id}
-        ).sort('timestamp', 1).limit(20))  # Get last 20 messages
+        ).sort('timestamp', 1).limit(20))
         
         messages = []
         for doc in history_docs:
@@ -87,7 +77,6 @@ class MongoDBChatMessageHistory(BaseChatMessageHistory):
         return messages
     
     def add_user_message(self, message: str):
-        """Add user message to MongoDB."""
         self.collection.insert_one({
             'session_id': self.session_id,
             'timestamp': datetime.utcnow(),
@@ -96,7 +85,6 @@ class MongoDBChatMessageHistory(BaseChatMessageHistory):
         })
     
     def add_ai_message(self, message: str):
-        """Add AI message to MongoDB."""
         self.collection.insert_one({
             'session_id': self.session_id,
             'timestamp': datetime.utcnow(),
@@ -105,12 +93,10 @@ class MongoDBChatMessageHistory(BaseChatMessageHistory):
         })
     
     def clear(self):
-        """Clear all messages for this session."""
         self.collection.delete_many({'session_id': self.session_id})
 
 
 def cosine_similarity(vec1: List[float], vec2: List[float]) -> float:
-    """Calculate cosine similarity between two vectors."""
     dot_product = sum(a * b for a, b in zip(vec1, vec2))
     magnitude_a = sum(a * a for a in vec1) ** 0.5
     magnitude_b = sum(b * b for b in vec2) ** 0.5
@@ -120,12 +106,8 @@ def cosine_similarity(vec1: List[float], vec2: List[float]) -> float:
 
 
 class MongoDBRetriever(BaseRetriever):
-    """Custom retriever that uses MongoDB embeddings for similarity search."""
-    
     def __init__(self, collection, embedding_model, k=5):
-        # Store attributes in a way that bypasses Pydantic validation
         super().__init__()
-        # Use object.__setattr__ to set attributes directly
         object.__setattr__(self, '_collection', collection)
         object.__setattr__(self, '_embedding_model', embedding_model)
         object.__setattr__(self, '_k', k)
@@ -143,14 +125,9 @@ class MongoDBRetriever(BaseRetriever):
         return self._k
     
     def _get_relevant_documents(self, query: str) -> List[Document]:
-        """Retrieve relevant documents based on query embedding."""
-        # Generate query embedding
         query_embedding = self.embedding_model.embed_query(query)
-        
-        # Get all documents with embeddings (in production, you'd want to limit this)
         all_docs = list(self.collection.find({"embedding": {"$exists": True}}))
         
-        # Calculate similarity for each document
         scored_docs = []
         for doc in all_docs:
             doc_embedding = doc.get("embedding", [])
@@ -158,11 +135,9 @@ class MongoDBRetriever(BaseRetriever):
                 similarity = cosine_similarity(query_embedding, doc_embedding)
                 scored_docs.append((similarity, doc))
         
-        # Sort by similarity and take top k
         scored_docs.sort(key=lambda x: x[0], reverse=True)
         top_docs = scored_docs[:self.k]
         
-        # Convert to LangChain Documents
         documents = []
         for similarity, doc in top_docs:
             documents.append(Document(
@@ -178,36 +153,27 @@ class MongoDBRetriever(BaseRetriever):
         return documents
     
     def get_relevant_documents(self, query: str) -> List[Document]:
-        """Public method to retrieve relevant documents."""
         return self._get_relevant_documents(query)
     
     async def _aget_relevant_documents(self, query: str) -> List[Document]:
-        """Async version of retrieval."""
         return self._get_relevant_documents(query)
     
     async def aget_relevant_documents(self, query: str) -> List[Document]:
-        """Public async method to retrieve relevant documents."""
         return await self._aget_relevant_documents(query)
 
 
 def create_retriever():
-    """Create a vector store retriever from MongoDB embeddings."""
     return MongoDBRetriever(
         collection=chunks_collection,
         embedding_model=embeddings,
-        k=5  # Return top 5 most relevant chunks
+        k=5
     )
 
 
 def create_agent(session_id: str):
-    """Create a LangChain agent for a specific session using LangChain 1.0 LCEL."""
-    # Create retriever
     retriever = create_retriever()
-    
-    # Create chat history
     chat_history = MongoDBChatMessageHistory(session_id)
     
-    # Create LLM
     llm = ChatOpenAI(
         model=LLM_MODEL,
         temperature=0.7,
@@ -215,7 +181,6 @@ def create_agent(session_id: str):
         openai_api_base=OPENROUTER_BASE_URL
     )
     
-    # Create history-aware retriever prompt
     contextualize_q_prompt = ChatPromptTemplate.from_messages([
         ("system", "Given a chat history and the latest user question "
          "which might reference context in the chat history, formulate a standalone question "
@@ -225,7 +190,6 @@ def create_agent(session_id: str):
         ("human", "{question}")
     ])
     
-    # Create history-aware retriever using LCEL
     def get_standalone_question(input: dict):
         if input.get("chat_history"):
             contextualize_chain = contextualize_q_prompt | llm | StrOutputParser()
@@ -236,7 +200,6 @@ def create_agent(session_id: str):
         question = get_standalone_question(input)
         return retriever.get_relevant_documents(question)
     
-    # Create QA prompt
     qa_prompt = ChatPromptTemplate.from_messages([
         ("system", """You are a helpful support agent with access to a knowledge base. 
 Use the following pieces of context from the knowledge base to answer the question.
@@ -247,17 +210,13 @@ Context: {context}"""),
         ("human", "{question}")
     ])
     
-    # Format documents
     def format_docs(docs):
         return "\n\n".join(doc.page_content for doc in docs)
     
-    # Create RAG chain using LCEL
     def rag_chain_invoke(input: dict):
-        # Get documents
         docs = retrieve_docs(input)
         context = format_docs(docs)
         
-        # Invoke QA chain
         qa_chain = qa_prompt | llm | StrOutputParser()
         answer = qa_chain.invoke({
             "context": context,
@@ -265,7 +224,6 @@ Context: {context}"""),
             "chat_history": input.get("chat_history", [])
         })
         
-        # Store docs in result for source tracking
         return {"answer": answer, "source_documents": docs}
     
     rag_chain = RunnablePassthrough() | rag_chain_invoke
@@ -275,7 +233,6 @@ Context: {context}"""),
 
 @app.get("/")
 async def get():
-    """Simple HTML page for testing WebSocket connections."""
     return HTMLResponse("""
     <!DOCTYPE html>
     <html>
@@ -352,7 +309,6 @@ async def get():
                 messages.scrollTop = messages.scrollHeight;
             }
             
-            // Allow Enter key to send
             document.getElementById('messageInput').addEventListener('keypress', (e) => {
                 if (e.key === 'Enter') {
                     sendMessage();
@@ -366,15 +322,12 @@ async def get():
 
 @app.websocket("/ws/{session_id}")
 async def websocket_endpoint(websocket: WebSocket, session_id: str):
-    """WebSocket endpoint for support agent."""
     await websocket.accept()
     active_connections[session_id] = websocket
     
-    # Create agent for this session
     chain, memory = create_agent(session_id)
     
     try:
-        # Send welcome message
         await websocket.send_json({
             "type": "welcome",
             "message": f"Connected to support agent. Session: {session_id}",
@@ -382,7 +335,6 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
         })
         
         while True:
-            # Receive message
             data = await websocket.receive_json()
             
             if data.get("type") == "query":
@@ -396,10 +348,8 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                     continue
                 
                 try:
-                    # Get chat history
                     chat_history_messages = memory.messages
                     
-                    # Process query through agent (run in thread pool since chain.invoke is sync)
                     loop = asyncio.get_running_loop()
                     result = await loop.run_in_executor(
                         None,
@@ -409,7 +359,6 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                         })
                     )
                     
-                    # Extract answer and source documents
                     if isinstance(result, dict):
                         answer = result.get("answer", "I couldn't generate an answer.")
                         source_docs = result.get("source_documents", [])
@@ -417,11 +366,9 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                         answer = str(result) if result else "I couldn't generate an answer."
                         source_docs = []
                     
-                    # Save to chat history
                     memory.add_user_message(question)
                     memory.add_ai_message(answer)
                     
-                    # Format sources
                     sources = []
                     for doc in source_docs:
                         if hasattr(doc, 'metadata') and hasattr(doc, 'page_content'):
@@ -431,7 +378,6 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                                 "text": doc.page_content[:200] + "..." if len(doc.page_content) > 200 else doc.page_content
                             })
                     
-                    # Send response
                     await websocket.send_json({
                         "type": "answer",
                         "answer": answer,
@@ -446,7 +392,6 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                     })
             
             elif data.get("type") == "clear_memory":
-                # Clear conversation memory
                 memory.clear()
                 await websocket.send_json({
                     "type": "message",
@@ -458,7 +403,6 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
     except Exception as e:
         print(f"Error in WebSocket connection {session_id}: {e}")
     finally:
-        # Clean up
         if session_id in active_connections:
             del active_connections[session_id]
 

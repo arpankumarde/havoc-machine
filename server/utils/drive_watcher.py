@@ -1,6 +1,4 @@
 #!/usr/bin/env python3
-"""Async Google Drive watcher utility for .pdf and .md files using page tokens.
-Can be used as a step in a linear pipeline."""
 
 import os
 import asyncio
@@ -26,13 +24,12 @@ STATE_FILE = ".drive_state.pkl"
 DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", "downloads")
 SUPPORTED_EXTENSIONS = {'.pdf', '.md'}
 MIME_TYPES = {'application/pdf': '.pdf', 'text/markdown': '.md', 'text/x-markdown': '.md'}
-MAX_CONCURRENT = 5  # Max concurrent downloads/uploads
+MAX_CONCURRENT = 5
 MAX_RETRIES = 3
-RETRY_DELAY = 1  # Base delay in seconds
+RETRY_DELAY = 1
 
 
 def retry_async(max_retries=MAX_RETRIES, delay=RETRY_DELAY):
-    """Async retry decorator with exponential backoff."""
     def decorator(func):
         @wraps(func)
         async def wrapper(*args, **kwargs):
@@ -44,21 +41,16 @@ def retry_async(max_retries=MAX_RETRIES, delay=RETRY_DELAY):
                     last_exception = e
                     if attempt < max_retries - 1:
                         wait_time = delay * (2 ** attempt)
-                        print(f"⚠️  Retry {attempt + 1}/{max_retries} for {func.__name__} after {wait_time}s: {e}")
+                        print(f"Retry {attempt + 1}/{max_retries} for {func.__name__} after {wait_time}s: {e}")
                         await asyncio.sleep(wait_time)
                     else:
-                        print(f"✗ Failed after {max_retries} retries: {func.__name__} - {e}")
+                        print(f"Failed after {max_retries} retries: {func.__name__} - {e}")
             raise last_exception
         return wrapper
     return decorator
 
 
 class DriveWatcher:
-    """Google Drive watcher that syncs files between Drive and local directory.
-    
-    Can be used as a step in a linear pipeline by calling watch() or initialize() methods.
-    """
-    
     def __init__(self, folder_id: str, auth_file: str = GCP_AUTH, download_dir: str = DOWNLOAD_DIR, 
                  state_file: str = STATE_FILE, poll_interval: int = POLL_INTERVAL):
         self.folder_id = folder_id
@@ -71,9 +63,9 @@ class DriveWatcher:
         self.known_files: Dict[str, Dict] = {}
         self.local_files: Dict[str, Dict] = {}
         self._lock = asyncio.Lock()
-        self._api_lock = asyncio.Lock()  # Serialize all API calls
-        self._executor = ThreadPoolExecutor(max_workers=1)  # Single thread for API calls
-        self._file_executor = ThreadPoolExecutor(max_workers=MAX_CONCURRENT)  # Parallel file I/O
+        self._api_lock = asyncio.Lock()
+        self._executor = ThreadPoolExecutor(max_workers=1)
+        self._file_executor = ThreadPoolExecutor(max_workers=MAX_CONCURRENT)
         os.makedirs(self.download_dir, exist_ok=True)
         self._authenticate()
         self._load_state()
@@ -101,7 +93,7 @@ class DriveWatcher:
                     self.known_files = state.get('known_files', {})
                     self.local_files = state.get('local_files', {})
             except (pickle.PickleError, IOError, KeyError, EOFError) as e:
-                print(f"⚠️  Failed to load state: {e}")
+                print(f"Failed to load state: {e}")
                 # Continue with empty state
     
     async def _save_state(self):
@@ -110,7 +102,7 @@ class DriveWatcher:
                 # Run in executor to avoid blocking
                 await asyncio.to_thread(self._save_state_sync)
             except Exception as e:
-                print(f"⚠️  Save state error: {e}")
+                print(f"Save state error: {e}")
     
     def _save_state_sync(self):
         try:
@@ -121,7 +113,7 @@ class DriveWatcher:
                     'local_files': self.local_files
                 }, f)
         except Exception as e:
-            print(f"⚠️  Save state error: {e}")
+            print(f"Save state error: {e}")
     
     def _is_supported(self, file_data: Dict) -> bool:
         mime = file_data.get('mimeType', '')
@@ -133,13 +125,11 @@ class DriveWatcher:
         return mime in MIME_TYPES
     
     async def _run_api_call(self, func, *args):
-        """Run API call in executor with lock to ensure thread safety."""
         async with self._api_lock:
             loop = asyncio.get_running_loop()
             return await loop.run_in_executor(self._executor, func, *args)
     
     async def _run_file_io(self, func, *args):
-        """Run file I/O in parallel executor."""
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(self._file_executor, func, *args)
     
@@ -148,9 +138,7 @@ class DriveWatcher:
         file_path = os.path.join(self.download_dir, file_name)
         try:
             def _download_sync():
-                # Get media request (API call - must be serialized)
                 request = self.service.files().get_media(fileId=file_id)
-                # Download to file (file I/O - can be parallel)
                 with open(file_path, 'wb') as f:
                     downloader = MediaIoBaseDownload(f, request)
                     done = False
@@ -163,12 +151,12 @@ class DriveWatcher:
             async with self._lock:
                 self.local_files[file_name] = {'file_id': file_id, 'mtime': mtime}
             
-            print(f"✓ Downloaded: {file_name}")
+            print(f"Downloaded: {file_name}")
         except HttpError as e:
-            print(f"✗ Download error: {file_name} - {e}")
+            print(f"Download error: {file_name} - {e}")
             raise
         except Exception as e:
-            print(f"✗ Download error: {file_name} - {e}")
+            print(f"Download error: {file_name} - {e}")
             raise
     
     async def _delete_local(self, file_name: str):
@@ -179,9 +167,9 @@ class DriveWatcher:
                 async with self._lock:
                     if file_name in self.local_files:
                         del self.local_files[file_name]
-                print(f"🗑️  Deleted local: {file_name}")
+                print(f"Deleted local: {file_name}")
             except Exception as e:
-                print(f"✗ Delete error: {file_name} - {e}")
+                print(f"Delete error: {file_name} - {e}")
     
     @retry_async()
     async def _upload(self, file_path: str, file_name: str):
@@ -201,13 +189,13 @@ class DriveWatcher:
                 self.local_files[file_name] = {'file_id': file['id'], 'mtime': mtime}
                 self.known_files[file['id']] = {'name': file_name, 'modifiedTime': file.get('modifiedTime')}
             
-            print(f"✓ Uploaded: {file_name}")
+            print(f"Uploaded: {file_name}")
             return file['id']
         except HttpError as e:
-            print(f"✗ Upload error: {file_name} - {e}")
+            print(f"Upload error: {file_name} - {e}")
             raise
         except Exception as e:
-            print(f"✗ Upload error: {file_name} - {e}")
+            print(f"Upload error: {file_name} - {e}")
             raise
     
     @retry_async()
@@ -227,12 +215,12 @@ class DriveWatcher:
                 self.local_files[file_name] = {'file_id': file_id, 'mtime': mtime}
                 self.known_files[file_id] = {'name': file_name, 'modifiedTime': file.get('modifiedTime')}
             
-            print(f"✓ Updated Drive: {file_name}")
+            print(f"Updated Drive: {file_name}")
         except HttpError as e:
-            print(f"✗ Update error: {file_name} - {e}")
+            print(f"Update error: {file_name} - {e}")
             raise
         except Exception as e:
-            print(f"✗ Update error: {file_name} - {e}")
+            print(f"Update error: {file_name} - {e}")
             raise
     
     async def _check_changes(self):
@@ -257,7 +245,7 @@ class DriveWatcher:
                     async with self._lock:
                         if file_id in self.known_files:
                             file_name = self.known_files[file_id].get('name')
-                            print(f"🗑️  Deleted from Drive: {file_name}")
+                            print(f"Deleted from Drive: {file_name}")
                             del self.known_files[file_id]
                             tasks.append(self._delete_local(file_name))
                     continue
@@ -281,15 +269,15 @@ class DriveWatcher:
                                 local_mtime = await self._run_file_io(os.path.getmtime, file_path)
                                 local_stored_mtime = self.local_files[file_name].get('mtime', 0)
                                 if local_mtime > local_stored_mtime:
-                                    print(f"⚠️  Conflict: {file_name} (Drive wins, overwriting local)")
+                                    print(f"Conflict: {file_name} (Drive wins, overwriting local)")
                                 else:
-                                    print(f"📝 Updated on Drive: {file_name}")
+                                    print(f"Updated on Drive: {file_name}")
                             else:
-                                print(f"📝 Updated on Drive: {file_name}")
+                                print(f"Updated on Drive: {file_name}")
                             tasks.append(self._download(file_id, file_name))
                             self.known_files[file_id] = file_data
                     else:
-                        print(f"✨ New on Drive: {file_name}")
+                        print(f"New on Drive: {file_name}")
                         tasks.append(self._download(file_id, file_name))
                         self.known_files[file_id] = file_data
             
@@ -298,22 +286,17 @@ class DriveWatcher:
                 results = await asyncio.gather(*tasks, return_exceptions=True)
                 for result in results:
                     if isinstance(result, Exception):
-                        print(f"⚠️  Task error: {result}")
+                        print(f"Task error: {result}")
             
             if new_token:
                 async with self._lock:
                     self.page_token = new_token
                 await self._save_state()
         except Exception as e:
-            print(f"✗ Error checking changes: {e}")
+            print(f"Error checking changes: {e}")
     
     async def initialize(self):
-        """Initialize the watcher by syncing existing files from Drive.
-        
-        Returns:
-            DriveWatcher: Returns self for pipeline chaining
-        """
-        print(f"🔍 Initializing folder: {self.folder_id}")
+        print(f"Initializing folder: {self.folder_id}")
         page_token = None
         download_tasks = []
         
@@ -338,17 +321,16 @@ class DriveWatcher:
                             mtime = await self._run_file_io(os.path.getmtime, file_path)
                             self.local_files[file_name] = {'file_id': item['id'], 'mtime': mtime}
                         else:
-                            print(f"📥 Downloading missing: {file_name}")
+                            print(f"Downloading missing: {file_name}")
                             download_tasks.append(self._download(item['id'], file_name))
                 
                 page_token = results.get('nextPageToken')
                 if not page_token:
                     break
             except HttpError as e:
-                print(f"✗ Error: {e}")
+                print(f"Error: {e}")
                 break
         
-        # Download all missing files in parallel
         if download_tasks:
             await asyncio.gather(*download_tasks, return_exceptions=True)
         
@@ -359,13 +341,11 @@ class DriveWatcher:
             self.page_token = await self._run_api_call(_get_start_token)
             await self._save_state()
         except (HttpError, Exception) as e:
-            print(f"⚠️  Failed to get start page token: {e}")
-            # Continue without page token - will use full sync next time
-        print(f"✓ Found {len(self.known_files)} files on Drive, {len(self.local_files)} local files")
+            print(f"Failed to get start page token: {e}")
+        print(f"Found {len(self.known_files)} files on Drive, {len(self.local_files)} local files")
         return self
     
     async def _check_local_changes(self):
-        """Check for local file changes and sync to Drive."""
         try:
             file_list = await self._run_file_io(os.listdir, self.download_dir)
             tasks = []
@@ -388,13 +368,13 @@ class DriveWatcher:
                         
                         if mtime > stored_mtime:
                             if file_id and file_id in self.known_files:
-                                print(f"📤 Uploading update: {file_name}")
+                                print(f"Uploading update: {file_name}")
                                 tasks.append(self._update_drive(file_id, file_path, file_name))
                             else:
-                                print(f"📤 Uploading new: {file_name}")
+                                print(f"Uploading new: {file_name}")
                                 tasks.append(self._upload(file_path, file_name))
                     else:
-                        print(f"📤 Uploading new local file: {file_name}")
+                        print(f"Uploading new local file: {file_name}")
                         tasks.append(self._upload(file_path, file_name))
             
             # Execute all uploads in parallel
@@ -402,7 +382,7 @@ class DriveWatcher:
                 results = await asyncio.gather(*tasks, return_exceptions=True)
                 for result in results:
                     if isinstance(result, Exception):
-                        print(f"⚠️  Upload task error: {result}")
+                        print(f"Upload task error: {result}")
                 await self._save_state()
             
             # Check for deleted local files
@@ -417,17 +397,17 @@ class DriveWatcher:
             delete_tasks = []
             for file_name, file_id in deleted_files:
                 if file_id and file_id in self.known_files:
-                    print(f"🗑️  Deleting from Drive: {file_name}")
+                    print(f"Deleting from Drive: {file_name}")
                     delete_tasks.append(self._delete_from_drive(file_id, file_name))
             
             if delete_tasks:
                 results = await asyncio.gather(*delete_tasks, return_exceptions=True)
                 for result in results:
                     if isinstance(result, Exception):
-                        print(f"⚠️  Delete task error: {result}")
+                        print(f"Delete task error: {result}")
                 await self._save_state()
         except Exception as e:
-            print(f"✗ Error checking local changes: {e}")
+            print(f"Error checking local changes: {e}")
     
     @retry_async()
     async def _delete_from_drive(self, file_id: str, file_name: str):
@@ -443,41 +423,31 @@ class DriveWatcher:
                 if file_name in self.local_files:
                     del self.local_files[file_name]
             
-            print(f"✓ Deleted from Drive: {file_name}")
+            print(f"Deleted from Drive: {file_name}")
         except HttpError as e:
-            print(f"✗ Delete from Drive error: {file_name} - {e}")
+            print(f"Delete from Drive error: {file_name} - {e}")
             raise
     
     async def sync_once(self):
-        """Perform a single sync operation (check changes once).
-        
-        Returns:
-            DriveWatcher: Returns self for pipeline chaining
-        """
         await asyncio.gather(
-            self._check_changes(),  # Drive -> Local
-            self._check_local_changes(),  # Local -> Drive
+            self._check_changes(),
+            self._check_local_changes(),
             return_exceptions=True
         )
         return self
     
     async def watch(self):
-        """Continuously watch for changes (runs indefinitely).
-        
-        Returns:
-            DriveWatcher: Returns self for pipeline chaining (after interruption)
-        """
-        print(f"👀 Watching (every {self.poll_interval}s)...")
+        print(f"Watching (every {self.poll_interval}s)...")
         try:
             while True:
                 await asyncio.gather(
-                    self._check_changes(),  # Drive -> Local
-                    self._check_local_changes(),  # Local -> Drive
+                    self._check_changes(),
+                    self._check_local_changes(),
                     return_exceptions=True
                 )
                 await asyncio.sleep(self.poll_interval)
         except KeyboardInterrupt:
-            print("\n🛑 Stopped")
+            print("\nStopped")
             await self._save_state()
         return self
 
@@ -488,20 +458,6 @@ async def watch_drive_step(folder_id: str, auth_file: str = GCP_AUTH,
                           poll_interval: int = POLL_INTERVAL,
                           initialize: bool = True,
                           watch: bool = False):
-    """Pipeline step function to watch Google Drive folder.
-    
-    Args:
-        folder_id: Google Drive folder ID to watch
-        auth_file: Path to Google service account JSON file
-        download_dir: Local directory to sync files to
-        state_file: Path to state persistence file
-        poll_interval: Seconds between sync checks
-        initialize: Whether to initialize and sync existing files first
-        watch: Whether to continuously watch (True) or sync once (False)
-    
-    Returns:
-        DriveWatcher: The watcher instance for further pipeline steps
-    """
     watcher = DriveWatcher(
         folder_id=folder_id,
         auth_file=auth_file,
