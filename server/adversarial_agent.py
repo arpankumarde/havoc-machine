@@ -107,6 +107,11 @@ class AdversarialAgent:
         self.kb_content: Dict[str, str] = {}
         self.kb_summary: str = ""
         
+        # Token usage tracking
+        self.total_tokens_used: int = 0
+        self.total_prompt_tokens: int = 0
+        self.total_completion_tokens: int = 0
+        
         # Load knowledge base content
         self._load_knowledge_base()
         
@@ -420,9 +425,8 @@ Analysis:""")
         if self.topic_focus:
             topic_focus_instruction = f"\n\nTOPIC FOCUS: Prioritize queries related to: {self.topic_focus}\nFocus your attacks on this specific area while still testing for KB drift and hallucination."
         
-        chain = self.strategy_prompt | self.adversarial_llm | StrOutputParser()
-        
-        query = await chain.ainvoke({
+        # Use invoke instead of ainvoke to get response with metadata, then extract text
+        prompt_value = self.strategy_prompt.invoke({
             "history": history,
             "kb_summary": self.kb_summary,
             "kb_excerpts": kb_excerpts,
@@ -431,7 +435,24 @@ Analysis:""")
             "topic_focus_instruction": topic_focus_instruction
         })
         
-        return query.strip()
+        # Invoke LLM and get response with metadata
+        response = await self.adversarial_llm.ainvoke(prompt_value.to_messages())
+        
+        # Track token usage from LLM response
+        if hasattr(response, 'response_metadata') and response.response_metadata:
+            metadata = response.response_metadata
+            if 'token_usage' in metadata:
+                usage = metadata['token_usage']
+                prompt_tokens = usage.get('prompt_tokens', 0)
+                completion_tokens = usage.get('completion_tokens', 0)
+                total_tokens = usage.get('total_tokens', 0)
+                self.total_tokens_used += total_tokens
+                self.total_prompt_tokens += prompt_tokens
+                self.total_completion_tokens += completion_tokens
+        
+        # Extract text from response
+        result = response.content if hasattr(response, 'content') else str(response)
+        return result.strip()
     
     async def analyze_response(
         self,
@@ -449,14 +470,30 @@ Analysis:""")
         sources_text = json.dumps(sources, indent=2) if sources else "No sources provided"
         
         # Use judge model for analysis (more grounded and accurate)
-        chain = self.analysis_prompt | self.judge_llm | StrOutputParser()
-        
-        analysis_text = await chain.ainvoke({
+        prompt_value = self.analysis_prompt.invoke({
             "query": query,
             "response": response,
             "sources": sources_text,
             "context": context_summary
         })
+        
+        # Invoke judge LLM and get response with metadata
+        judge_response = await self.judge_llm.ainvoke(prompt_value.to_messages())
+        
+        # Track token usage from judge LLM response
+        if hasattr(judge_response, 'response_metadata') and judge_response.response_metadata:
+            metadata = judge_response.response_metadata
+            if 'token_usage' in metadata:
+                usage = metadata['token_usage']
+                prompt_tokens = usage.get('prompt_tokens', 0)
+                completion_tokens = usage.get('completion_tokens', 0)
+                total_tokens = usage.get('total_tokens', 0)
+                self.total_tokens_used += total_tokens
+                self.total_prompt_tokens += prompt_tokens
+                self.total_completion_tokens += completion_tokens
+        
+        # Extract text from response
+        analysis_text = judge_response.content if hasattr(judge_response, 'content') else str(judge_response)
         
         # Try to parse JSON from the response
         try:
@@ -739,6 +776,18 @@ Analysis:""")
             else:
                 network_stats["response_time_delta_ms"] = 0
                 network_stats["response_time_delta_percent"] = 0
+        
+        # Add token usage statistics
+        network_stats["total_tokens_used"] = self.total_tokens_used
+        network_stats["total_prompt_tokens"] = self.total_prompt_tokens
+        network_stats["total_completion_tokens"] = self.total_completion_tokens
+        
+        # Calculate throughput (tokens per second)
+        duration_seconds = duration_minutes * 60
+        if duration_seconds > 0 and self.total_tokens_used > 0:
+            network_stats["throughput_tokens_per_second"] = self.total_tokens_used / duration_seconds
+        else:
+            network_stats["throughput_tokens_per_second"] = 0.0
         
         # Test parameters
         test_parameters = {

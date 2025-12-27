@@ -183,32 +183,68 @@ def consolidate_reports(reports: List[AdversarialReport], group_id: str) -> Dict
     overall_end = max(end_times) if end_times else datetime.now()
     overall_duration = (overall_end - overall_start).total_seconds() / 60
     
-    # Aggregate network stats
+    # Aggregate network stats - collect all individual response times from all conversation turns
     aggregated_network_stats = {}
-    if all_network_stats:
-        response_times = []
-        query_times = []
-        analysis_times = []
-        total_requests = 0
+    all_response_times = []
+    all_query_times = []
+    all_analysis_times = []
+    total_tokens_used = 0
+    total_prompt_tokens = 0
+    total_completion_tokens = 0
+    
+    # Collect all individual response times from all conversation turns across all reports
+    for report in reports:
+        for turn in report.conversation_history:
+            if turn.response_time_ms > 0:
+                all_response_times.append(turn.response_time_ms)
+            if turn.query_generation_time_ms > 0:
+                all_query_times.append(turn.query_generation_time_ms)
+            if turn.analysis_time_ms > 0:
+                all_analysis_times.append(turn.analysis_time_ms)
         
-        for stats in all_network_stats:
-            if stats.get("avg_response_time_ms"):
-                response_times.append(stats["avg_response_time_ms"])
-            if stats.get("avg_query_generation_time_ms"):
-                query_times.append(stats["avg_query_generation_time_ms"])
-            if stats.get("avg_analysis_time_ms"):
-                analysis_times.append(stats["avg_analysis_time_ms"])
-            total_requests += stats.get("total_requests", 0)
+        # Aggregate token usage from each report's network stats
+        if report.network_stats:
+            total_tokens_used += report.network_stats.get('total_tokens_used', 0)
+            total_prompt_tokens += report.network_stats.get('total_prompt_tokens', 0)
+            total_completion_tokens += report.network_stats.get('total_completion_tokens', 0)
+    
+    if all_response_times:
+        sorted_times = sorted(all_response_times)
+        n = len(sorted_times)
+        aggregated_network_stats = {
+            "avg_response_time_ms": sum(all_response_times) / n,
+            "min_response_time_ms": min(all_response_times),
+            "max_response_time_ms": max(all_response_times),
+            "p50_latency_ms": sorted_times[n // 2] if n > 0 else 0,
+            "p95_latency_ms": sorted_times[min(int(n * 0.95), n - 1)] if n > 0 else 0,
+            "p99_latency_ms": sorted_times[min(int(n * 0.99), n - 1)] if n > 0 else 0,
+            "total_requests": n,
+            "avg_query_generation_time_ms": sum(all_query_times) / len(all_query_times) if all_query_times else 0,
+            "avg_analysis_time_ms": sum(all_analysis_times) / len(all_analysis_times) if all_analysis_times else 0,
+        }
         
-        if response_times:
-            aggregated_network_stats = {
-                "avg_response_time_ms": sum(response_times) / len(response_times),
-                "min_response_time_ms": min(response_times),
-                "max_response_time_ms": max(response_times),
-                "total_requests": total_requests,
-                "avg_query_generation_time_ms": sum(query_times) / len(query_times) if query_times else 0,
-                "avg_analysis_time_ms": sum(analysis_times) / len(analysis_times) if analysis_times else 0,
-            }
+        # Calculate response time delta (first half vs second half)
+        if len(all_response_times) >= 4:
+            first_half = all_response_times[:len(all_response_times) // 2]
+            second_half = all_response_times[len(all_response_times) // 2:]
+            avg_first = sum(first_half) / len(first_half)
+            avg_second = sum(second_half) / len(second_half)
+            aggregated_network_stats["response_time_delta_ms"] = avg_second - avg_first
+            aggregated_network_stats["response_time_delta_percent"] = ((avg_second - avg_first) / avg_first * 100) if avg_first > 0 else 0
+        else:
+            aggregated_network_stats["response_time_delta_ms"] = 0
+            aggregated_network_stats["response_time_delta_percent"] = 0
+        
+        # Add aggregated token usage statistics
+        aggregated_network_stats["total_tokens_used"] = total_tokens_used
+        aggregated_network_stats["total_prompt_tokens"] = total_prompt_tokens
+        aggregated_network_stats["total_completion_tokens"] = total_completion_tokens
+        
+        # Calculate overall throughput (tokens per second)
+        if overall_duration > 0 and total_tokens_used > 0:
+            aggregated_network_stats["throughput_tokens_per_second"] = total_tokens_used / (overall_duration * 60)
+        else:
+            aggregated_network_stats["throughput_tokens_per_second"] = 0.0
     
     # Generate consolidated recommendations
     recommendations = []

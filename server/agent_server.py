@@ -8,6 +8,7 @@ from datetime import datetime
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, BackgroundTasks
 from fastapi.responses import HTMLResponse
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from pymongo import MongoClient
@@ -32,6 +33,15 @@ LLM_MODEL = "openai/gpt-4o-mini"
 
 app = FastAPI()
 
+# set all cors to *
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+ 
 mongo_client = MongoClient(MONGODB_URI)
 db = mongo_client[MONGODB_DB_NAME]
 chunks_collection = db[MONGODB_COLLECTION_NAME]

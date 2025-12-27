@@ -5,13 +5,42 @@ import json
 from pathlib import Path
 from typing import Optional, Dict, Any
 from datetime import datetime
+from urllib.parse import quote
 from adversarial_agent import AdversarialReport, VulnerabilityType
+from dotenv import load_dotenv
+import boto3
+from botocore.exceptions import ClientError
+
+load_dotenv()
 
 
 class ReportGenerator:
     def __init__(self, output_dir: str = "reports"):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(exist_ok=True)
+        
+        # S3 configuration from environment variables
+        self.s3_bucket = os.getenv("S3_BUCKET") or os.getenv("AWS_S3_BUCKET")
+        self.s3_region = os.getenv("AWS_REGION") or os.getenv("AWS_S3_REGION", "us-east-1")
+        self.s3_access_key = os.getenv("AWS_ACCESS_KEY_ID")
+        self.s3_secret_key = os.getenv("AWS_SECRET_ACCESS_KEY")
+        self.s3_folder_name = os.getenv("S3_FOLDER_NAME", "grp")
+        self.s3_enabled = bool(self.s3_bucket and self.s3_access_key and self.s3_secret_key)
+        
+        # Initialize S3 client if credentials are available
+        self.s3_client = None
+        if self.s3_enabled:
+            try:
+                self.s3_client = boto3.client(
+                    's3',
+                    aws_access_key_id=self.s3_access_key,
+                    aws_secret_access_key=self.s3_secret_key,
+                    region_name=self.s3_region
+                )
+                print(f"S3 client initialized for bucket: {self.s3_bucket}")
+            except Exception as e:
+                print(f"Warning: Failed to initialize S3 client: {e}")
+                self.s3_enabled = False
     
     def generate_json_report(self, report: AdversarialReport) -> list:
         """Generate a JSON report with only message history array"""
@@ -371,10 +400,41 @@ class ReportGenerator:
         json_path = self.save_report(report, format="json")
         return md_path, json_path
     
+    def _upload_to_s3(self, content: str, s3_key: str, content_type: str = "text/plain") -> Optional[str]:
+        """Upload content to S3 and return the URL"""
+        if not self.s3_enabled or not self.s3_client:
+            return None
+        
+        try:
+            self.s3_client.put_object(
+                Bucket=self.s3_bucket,
+                Key=s3_key,
+                Body=content.encode('utf-8'),
+                ContentType=content_type
+            )
+            
+            # Construct S3 URL - properly encode the key but preserve slashes
+            encoded_key = quote(s3_key, safe='/')
+            
+            # Use standard S3 URL format
+            # For ap-south-1 and other regions, use: bucket.s3.region.amazonaws.com
+            # For us-east-1, can use either format but we'll use explicit region for consistency
+            url = f"https://{self.s3_bucket}.s3.{self.s3_region}.amazonaws.com/{encoded_key}"
+            
+            print(f"Uploaded to S3: {url}")
+            return url
+        except ClientError as e:
+            print(f"Error uploading to S3: {e}")
+            return None
+        except Exception as e:
+            print(f"Unexpected error uploading to S3: {e}")
+            return None
+    
     def save_consolidated_report(self, consolidated_data: Dict[str, Any], group_id: str) -> tuple[str, str]:
-        """Save consolidated report from multiple agents"""
-        timestamp = consolidated_data["start_time"].strftime('%Y%m%d-%H%M%S')
-        filename = f"grp-{group_id}_{timestamp}"
+        """Save consolidated report from multiple agents to S3"""
+        # Use simple pattern: {s3_folder_name}/{group_id}.md and {s3_folder_name}/{group_id}.json
+        # Extract just the group_id part (remove "grp-" prefix if present)
+        clean_group_id = group_id.replace("grp-", "") if group_id.startswith("grp-") else group_id
         
         # Convert ConversationTurn objects to dicts for JSON serialization
         json_data = consolidated_data.copy()
@@ -414,16 +474,33 @@ class ReportGenerator:
         json_data["start_time"] = consolidated_data["start_time"].isoformat()
         json_data["end_time"] = consolidated_data["end_time"].isoformat()
         
-        # Save JSON format
-        json_path = self.output_dir / f"{filename}.json"
-        json_path.write_text(json.dumps(json_data, indent=2, default=str), encoding='utf-8')
-        
-        # Generate and save markdown format
+        # Generate markdown content
         md_content = self.generate_consolidated_markdown(consolidated_data)
-        md_path = self.output_dir / f"{filename}.md"
-        md_path.write_text(md_content, encoding='utf-8')
+        json_content = json.dumps(json_data, indent=2, default=str)
         
-        return str(md_path), str(json_path)
+        # Upload to S3 with simple pattern: {s3_folder_name}/{group_id}.md and {s3_folder_name}/{group_id}.json
+        md_s3_key = f"{self.s3_folder_name}/{clean_group_id}.md"
+        json_s3_key = f"{self.s3_folder_name}/{clean_group_id}.json"
+        
+        md_url = self._upload_to_s3(md_content, md_s3_key, content_type="text/markdown")
+        json_url = self._upload_to_s3(json_content, json_s3_key, content_type="application/json")
+        
+        # If S3 upload failed, fall back to local storage
+        if not md_url or not json_url:
+            print("Warning: S3 upload failed, falling back to local storage")
+            timestamp = consolidated_data["start_time"].strftime('%Y%m%d-%H%M%S')
+            filename = f"grp-{group_id}_{timestamp}"
+            
+            json_path = self.output_dir / f"{filename}.json"
+            json_path.write_text(json_content, encoding='utf-8')
+            
+            md_path = self.output_dir / f"{filename}.md"
+            md_path.write_text(md_content, encoding='utf-8')
+            
+            return str(md_path), str(json_path)
+        
+        # Return S3 URLs
+        return md_url, json_url
     
     def generate_consolidated_markdown(self, consolidated_data: Dict[str, Any]) -> str:
         """Generate markdown report for consolidated results"""
@@ -457,12 +534,58 @@ class ReportGenerator:
         lines.append(f"**Total Vulnerabilities Found:** {total_vulnerabilities}")
         lines.append("")
         
+        # Network Statistics
+        lines.append("## Network Statistics")
+        lines.append("")
         if consolidated_data.get('network_stats'):
             stats = consolidated_data['network_stats']
-            lines.append("### Network Statistics")
+            lines.append("### Response Time Metrics")
             lines.append("")
             lines.append(f"- **Average Response Time:** {stats.get('avg_response_time_ms', 0):.2f} ms")
+            lines.append(f"- **Minimum Response Time:** {stats.get('min_response_time_ms', 0):.2f} ms")
+            lines.append(f"- **Maximum Response Time:** {stats.get('max_response_time_ms', 0):.2f} ms")
+            lines.append(f"- **P50 Latency (Median):** {stats.get('p50_latency_ms', 0):.2f} ms")
+            lines.append(f"- **P95 Latency:** {stats.get('p95_latency_ms', 0):.2f} ms")
+            lines.append(f"- **P99 Latency:** {stats.get('p99_latency_ms', 0):.2f} ms")
+            lines.append("")
+            
+            lines.append("### Response Time Delta")
+            lines.append("")
+            delta_ms = stats.get('response_time_delta_ms', 0)
+            delta_percent = stats.get('response_time_delta_percent', 0)
+            if delta_ms > 0:
+                lines.append(f"- **Delta (Second Half - First Half):** +{delta_ms:.2f} ms ({delta_percent:+.2f}%)")
+                lines.append(f"- **Trend:** ⚠️ Response times increased during test by {delta_percent:+.2f}%")
+            elif delta_ms < 0:
+                lines.append(f"- **Delta (Second Half - First Half):** {delta_ms:.2f} ms ({delta_percent:.2f}%)")
+                lines.append(f"- **Trend:** ✅ Response times improved during test by {abs(delta_percent):.2f}%")
+            else:
+                lines.append(f"- **Delta (Second Half - First Half):** {delta_ms:.2f} ms")
+                lines.append(f"- **Trend:** ➡️ Response times remained stable")
+            lines.append("")
+            
+            lines.append("### Additional Network Metrics")
+            lines.append("")
             lines.append(f"- **Total Requests:** {stats.get('total_requests', 0)}")
+            lines.append(f"- **Average Query Generation Time:** {stats.get('avg_query_generation_time_ms', 0):.2f} ms")
+            lines.append(f"- **Average Analysis Time:** {stats.get('avg_analysis_time_ms', 0):.2f} ms")
+            lines.append("")
+            
+            # Token Usage
+            lines.append("### Token Usage")
+            lines.append("")
+            total_tokens = stats.get('total_tokens_used', 0)
+            prompt_tokens = stats.get('total_prompt_tokens', 0)
+            completion_tokens = stats.get('total_completion_tokens', 0)
+            throughput = stats.get('throughput_tokens_per_second', 0)
+            
+            lines.append(f"- **Total Tokens Used (Adversarial):** {total_tokens:,}")
+            lines.append(f"- **Prompt Tokens:** {prompt_tokens:,}")
+            lines.append(f"- **Completion Tokens:** {completion_tokens:,}")
+            lines.append(f"- **Throughput:** {throughput:.2f} tokens/second")
+            lines.append("")
+        else:
+            lines.append("No network statistics available.")
             lines.append("")
         
         # Risk Summary
