@@ -148,3 +148,35 @@ main li {
 main ul {
   list-style-position: inside;
 }
+
+/* Fade-in animation for processing status */
+@keyframes fade-in {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.animate-fade-in {
+  animation: fade-in 0.5s ease-out;
+}
+
+/* Message popup animation */
+@keyframes message-popup {
+  from {
+    opacity: 0;
+    transform: translateY(20px) scale(0.95);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+.animate-message-popup {
+  animation: message-popup 0.4s cubic-bezier(0.34, 1.56, 0.64, 1) forwards;
+}

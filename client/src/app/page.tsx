@@ -78,7 +78,7 @@ const Page = () => {
               <>
                 <Link href="/dashboard">
                   <Button 
-                    className="border-2 border-[#B91C1C] text-[#1E1E1E] hover:bg-[#B91C1C] hover:text-white"
+                    className="border-2 border-[#B91C1C] hover:bg-[#B91C1C] text-white"
                   >
                     <LayoutDashboard className="w-4 h-4 mr-2" />
                     Dashboard
